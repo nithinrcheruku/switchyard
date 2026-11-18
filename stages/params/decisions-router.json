@@ -1,0 +1,10 @@
+{
+  "JudgeBackend": "decisions",
+  "AllowClassifierOverride": "false",
+  "DecisionsModel": "gemini-decision-1",
+  "DecisionsAuthMode": "api_key",
+  "DecisionsMinConfidence": "0.50",
+  "DecisionsLowConfidenceTier": "tier2-daily",
+  "DecisionsEscalationThreshold": "0.85",
+  "SemanticCacheEnabled": "false"
+}

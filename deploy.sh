@@ -460,6 +460,41 @@ def render_policy_xml(step, params):
 </AssignMessage>
 """
 
+    if ptype == "KeyValueMapOperations":
+        map_id = props.get("mapIdentifier", "switchyard-secrets")
+        scope = props.get("scope", "environment")
+        exclusive_cache = str(props.get("exclusiveCache", False)).lower()
+        expiry = props.get("expiryTimeInSecs", 300)
+        continue_on_err = str(props.get("continueOnError", True)).lower()
+        gets = props.get("get") or []
+        get_blocks = []
+        for g in gets:
+            assign_to = g.get("assignTo", "")
+            key_params = g.get("key") or []
+            if isinstance(key_params, str):
+                key_params = [key_params]
+            param_lines = "\n".join(
+                f"            <Parameter>{xml_escape(str(kp))}</Parameter>"
+                for kp in key_params
+            )
+            get_blocks.append(
+                f"""    <Get assignTo="{xml_escape(str(assign_to))}">
+        <Key>
+{param_lines}
+        </Key>
+    </Get>"""
+            )
+        gets_xml = "\n".join(get_blocks)
+        return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<KeyValueMapOperations async="false" continueOnError="{continue_on_err}" enabled="true" name="{xml_escape(name)}" mapIdentifier="{xml_escape(str(map_id))}">
+    <DisplayName>{xml_escape(name)}</DisplayName>
+    <ExclusiveCache>{exclusive_cache}</ExclusiveCache>
+    <ExpiryTimeInSecs>{expiry}</ExpiryTimeInSecs>
+{gets_xml}
+    <Scope>{xml_escape(str(scope))}</Scope>
+</KeyValueMapOperations>
+"""
+
     if ptype == "ServiceCallout":
         timeout = props.get("timeout", 30000)
         req_cfg = props.get("request") or {}
@@ -468,21 +503,43 @@ def render_policy_xml(step, params):
         http_target = props.get("httpTargetConnection") or {}
         url = http_target.get("url", "")
         set_cfg = req_cfg.get("set") or {}
+        auth_cfg = http_target.get("authentication") or {}
+        auth_mode = str(auth_cfg.get("mode", "")).strip().lower()
+        id_token_cfg = auth_cfg.get("googleIdToken") or {}
+
+        hdrs = dict(set_cfg.get("headers") or {})
+        if auth_mode in ("api_key", "apikey"):
+            ak_header = str(auth_cfg.get("apiKeyHeader", "x-goog-api-key")).strip()
+            ak_value = str(auth_cfg.get("apiKeyValue", "")).strip()
+            if ak_header and ak_value:
+                hdrs[ak_header] = ak_value
+        elif auth_mode in ("oauth", "google_access_token", "googleaccesstoken"):
+            up_val = str(auth_cfg.get("userProjectHeader", "")).strip()
+            if up_val:
+                hdrs["x-goog-user-project"] = up_val
+
         set_xml = ""
         if set_cfg:
             verb = set_cfg.get("verb", "POST")
             pl = set_cfg.get("payload") or {}
             ctype = pl.get("contentType", "application/json")
             pcontent = (pl.get("content") or "").strip()
+            hdr_xml = ""
+            if hdrs:
+                sh_items = "\n".join(
+                    f'                <Header name="{xml_escape(str(hk))}">{xml_escape(str(hv))}</Header>'
+                    for hk, hv in hdrs.items()
+                )
+                hdr_xml = f"\n            <Headers>\n{sh_items}\n            </Headers>"
             set_xml = f"""
-        <Set>
+        <Set>{hdr_xml}
             <Verb>{xml_escape(str(verb))}</Verb>
             <Payload contentType="{xml_escape(str(ctype))}">{xml_escape(pcontent)}</Payload>
         </Set>"""
         # Google APIs take an OAuth access token (the default). IAM-protected services such
-        # as Cloud Run take an ID token minted for a specific audience instead.
-        auth_cfg = http_target.get("authentication") or {}
-        id_token_cfg = auth_cfg.get("googleIdToken") or {}
+        # as Cloud Run take an ID token minted for a specific audience instead. Gemini Developer
+        # API endpoints (such as the Decisions API) also support API-key auth via encrypted KVM
+        # (mode: api_key, which omits <Authentication> and sends x-goog-api-key).
         if id_token_cfg:
             audience = str(id_token_cfg.get("audience", "")).strip()
             if not audience:
@@ -491,15 +548,27 @@ def render_policy_xml(step, params):
             <GoogleIDToken>
                 <Audience>{xml_escape(audience)}</Audience>
             </GoogleIDToken>
-        </Authentication>"""
+        </Authentication>\n"""
+        elif auth_mode in ("none", "api_key", "apikey"):
+            auth_xml = ""
         else:
-            auth_xml = """        <Authentication>
+            raw_scopes = auth_cfg.get("scopes") or (auth_cfg.get("googleAccessToken") or {}).get("scopes") or []
+            if isinstance(raw_scopes, dict):
+                raw_scopes = [raw_scopes.get("scope")] if raw_scopes.get("scope") else []
+            elif isinstance(raw_scopes, str):
+                raw_scopes = [raw_scopes]
+            if not raw_scopes:
+                raw_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+            scope_lines = "\n".join(
+                f"                    <Scope>{xml_escape(str(sc))}</Scope>" for sc in raw_scopes if sc
+            )
+            auth_xml = f"""        <Authentication>
             <GoogleAccessToken>
                 <Scopes>
-                    <Scope>https://www.googleapis.com/auth/cloud-platform</Scope>
+{scope_lines}
                 </Scopes>
             </GoogleAccessToken>
-        </Authentication>"""
+        </Authentication>\n"""
         return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <ServiceCallout async="false" continueOnError="true" enabled="true" name="{xml_escape(name)}">
     <DisplayName>{xml_escape(name)}</DisplayName>
@@ -508,8 +577,7 @@ def render_policy_xml(step, params):
     </Request>
     <Response>{xml_escape(str(resp_var))}</Response>
     <HTTPTargetConnection>
-{auth_xml}
-        <URL>{xml_escape(str(url))}</URL>
+{auth_xml}        <URL>{xml_escape(str(url))}</URL>
     </HTTPTargetConnection>
 </ServiceCallout>
 """
@@ -875,6 +943,70 @@ def compile_stage(stage_file, build_dir, gcp_project_id, model_armor_region, mod
             },
         }
 
+        spec = template_cfg.get("spec") or {}
+        proxy_ep = (spec.get("proxyEndpoints") or [{}])[0]
+        base_path = proxy_ep.get("basePath", "/")
+        route_rules = proxy_ep.get("routeRules") or []
+
+        # Pre-scan target endpoints for custom auth modes (e.g. Gemini Decisions API target)
+        # so any auto-synthesized policies are written to apiproxy/policies/ and listed in the manifest.
+        target_extra_preflow = {}
+        for tep in spec.get("targetEndpoints") or []:
+            tname = tep["name"]
+            t_auth = substitute_params((tep.get("httpTargetConnection") or {}).get("authentication") or {}, params)
+            t_mode = str(t_auth.get("mode", "")).strip().lower()
+            extra_steps = []
+            if t_mode in ("api_key", "apikey"):
+                if "KVM-GetDecisionsApiKey" not in policy_defs:
+                    policy_defs["KVM-GetDecisionsApiKey"] = {
+                        "name": "KVM-GetDecisionsApiKey",
+                        "type": "KeyValueMapOperations",
+                        "properties": {
+                            "mapIdentifier": params.get("DecisionsApiKeyKvmMap", "switchyard-secrets"),
+                            "scope": "environment",
+                            "exclusiveCache": False,
+                            "expiryTimeInSecs": 300,
+                            "continueOnError": True,
+                            "get": [
+                                {
+                                    "assignTo": "private.decisions.apiKey",
+                                    "key": [params.get("DecisionsApiKeyKvmEntry", "gemini_decisions_api_key")],
+                                }
+                            ],
+                        },
+                    }
+                ak_hdr = str(t_auth.get("apiKeyHeader", "x-goog-api-key")).strip()
+                ak_val = str(t_auth.get("apiKeyValue", "{private.decisions.apiKey}")).strip()
+                policy_defs["AM-InjectDecisionsTargetAuth"] = {
+                    "name": "AM-InjectDecisionsTargetAuth",
+                    "type": "AssignMessage",
+                    "properties": {
+                        "set": {
+                            "headers": {
+                                ak_hdr: ak_val,
+                            }
+                        }
+                    },
+                }
+                extra_steps.append({"name": "KVM-GetDecisionsApiKey"})
+                extra_steps.append({"name": "AM-InjectDecisionsTargetAuth"})
+            elif t_mode in ("oauth", "google_access_token", "googleaccesstoken"):
+                up_hdr = str(t_auth.get("userProjectHeader", "{GCPProjectId}")).strip()
+                if up_hdr:
+                    policy_defs["AM-InjectDecisionsTargetAuth"] = {
+                        "name": "AM-InjectDecisionsTargetAuth",
+                        "type": "AssignMessage",
+                        "properties": {
+                            "set": {
+                                "headers": {
+                                    "x-goog-user-project": up_hdr,
+                                }
+                            }
+                        },
+                    }
+                    extra_steps.append({"name": "AM-InjectDecisionsTargetAuth"})
+            target_extra_preflow[tname] = extra_steps
+
         all_referenced_steps = (
             pre_req_steps
             + pre_resp_steps
@@ -889,6 +1021,8 @@ def compile_stage(stage_file, build_dir, gcp_project_id, model_armor_region, mod
             all_referenced_steps.extend(fl.get("response") or [])
         for fr in proxy_fault_rules + target_fault_rules:
             all_referenced_steps.extend(fr.get("steps") or [])
+        for extra_list in target_extra_preflow.values():
+            all_referenced_steps.extend(extra_list)
         for st_ref in all_referenced_steps:
             st_name = st_ref["name"] if isinstance(st_ref, dict) else str(st_ref)
             if st_name not in policy_defs:
@@ -900,11 +1034,6 @@ def compile_stage(stage_file, build_dir, gcp_project_id, model_armor_region, mod
             with open(ppath, "w", encoding="utf-8") as f:
                 f.write(pxml)
             validate_xml_file(ppath)
-
-        spec = template_cfg.get("spec") or {}
-        proxy_ep = (spec.get("proxyEndpoints") or [{}])[0]
-        base_path = proxy_ep.get("basePath", "/")
-        route_rules = proxy_ep.get("routeRules") or []
 
         flows_xml_parts = []
         for fl in proxy_flows:
@@ -1022,16 +1151,43 @@ def compile_stage(stage_file, build_dir, gcp_project_id, model_armor_region, mod
                 for pk, pv in tprops.items()
             ]
             t_fault_parts = []
-            for tfr in target_fault_rules:
-                tfr_name = tfr.get("name", "TargetFaultRule")
-                tfr_cond = tfr.get("condition", "")
-                tfr_steps = render_step_list(tfr.get("steps") or [], "            ")
-                tfr_cond_line = f"\n        <Condition>{xml_escape(str(tfr_cond))}</Condition>" if tfr_cond else ""
-                t_fault_parts.append(
-                    f"""    <FaultRule name="{xml_escape(tfr_name)}">
+            use_vertex_fallback = not bool(tep.get("disableVertexFallback"))
+            if use_vertex_fallback:
+                for tfr in target_fault_rules:
+                    tfr_name = tfr.get("name", "TargetFaultRule")
+                    tfr_cond = tfr.get("condition", "")
+                    tfr_steps = render_step_list(tfr.get("steps") or [], "            ")
+                    tfr_cond_line = f"\n        <Condition>{xml_escape(str(tfr_cond))}</Condition>" if tfr_cond else ""
+                    t_fault_parts.append(
+                        f"""    <FaultRule name="{xml_escape(tfr_name)}">
 {tfr_steps}{tfr_cond_line}
     </FaultRule>"""
+                    )
+            eff_target_post_resp = target_post_resp_steps if use_vertex_fallback else []
+
+            t_preflow_steps = [{"name": "AM-DisableTargetPathSuffix"}] + list(
+                target_extra_preflow.get(tname) or []
+            )
+            t_auth = substitute_params(http_conn.get("authentication") or {}, params)
+            t_mode = str(t_auth.get("mode", "")).strip().lower()
+            if t_mode in ("none", "api_key", "apikey"):
+                t_auth_xml = ""
+            else:
+                t_scopes = t_auth.get("scopes") or (t_auth.get("googleAccessToken") or {}).get("scopes") or []
+                if isinstance(t_scopes, str):
+                    t_scopes = [t_scopes]
+                if not t_scopes:
+                    t_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+                t_scope_lines = "\n".join(
+                    f"                    <Scope>{xml_escape(str(sc))}</Scope>" for sc in t_scopes if sc
                 )
+                t_auth_xml = f"""        <Authentication>
+            <GoogleAccessToken>
+                <Scopes>
+{t_scope_lines}
+                </Scopes>
+            </GoogleAccessToken>
+        </Authentication>\n"""
 
             target_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <TargetEndpoint name="{xml_escape(tname)}">
@@ -1040,9 +1196,7 @@ def compile_stage(stage_file, build_dir, gcp_project_id, model_armor_region, mod
     </FaultRules>
     <PreFlow name="PreFlow">
         <Request>
-            <Step>
-                <Name>AM-DisableTargetPathSuffix</Name>
-            </Step>
+{render_step_list(t_preflow_steps, "            ")}
         </Request>
         <Response/>
     </PreFlow>
@@ -1050,18 +1204,11 @@ def compile_stage(stage_file, build_dir, gcp_project_id, model_armor_region, mod
     <PostFlow name="PostFlow">
         <Request/>
         <Response>
-{render_step_list(target_post_resp_steps, "            ")}
+{render_step_list(eff_target_post_resp, "            ")}
         </Response>
     </PostFlow>
     <HTTPTargetConnection>
-        <Authentication>
-            <GoogleAccessToken>
-                <Scopes>
-                    <Scope>https://www.googleapis.com/auth/cloud-platform</Scope>
-                </Scopes>
-            </GoogleAccessToken>
-        </Authentication>
-        <Properties>
+{t_auth_xml}        <Properties>
 {chr(10).join(prop_lines)}
         </Properties>
         <URL>{xml_escape(str(raw_url))}</URL>

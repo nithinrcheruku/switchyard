@@ -4,7 +4,7 @@
 Sends every prompt of a labelled eval set to `model: auto` once per classifier backend and
 reads the gateway's own attribution headers:
 
-    X-Router-Classifier      which step decided: rules | custom | gemini | length-fallback
+    X-Router-Classifier      which step decided: rules | custom | decisions | gemini | length-fallback
     X-Router-Classifier-Ms   time the classifier callout added inside the gateway
     X-Vertex-Target-Tier     tier the request was routed to
 
@@ -130,7 +130,7 @@ def report(backend: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     callout_ms = [float(r["X-Router-Classifier-Ms"]) for r in rows
-                  if r.get("X-Router-Classifier") in ("custom", "gemini") and r.get("X-Router-Classifier-Ms")]
+                  if r.get("X-Router-Classifier") in ("custom", "decisions", "gemini") and r.get("X-Router-Classifier-Ms")]
     failed_callout_ms = [float(r["X-Router-Classifier-Ms"]) for r in rows
                          if r.get("X-Router-Classifier") == "length-fallback"
                          and float(r.get("X-Router-Classifier-Ms") or 0) > 0]
@@ -146,7 +146,7 @@ def report(backend: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "total_request_ms": summarize([r["total_ms"] for r in rows if r["status"] == 200]),
         "tier_vs_gold_all": agreement(answered),
         "tier_vs_gold_when_classifier_decided": agreement(
-            [r for r in answered if r.get("X-Router-Classifier") in ("custom", "gemini")]),
+            [r for r in answered if r.get("X-Router-Classifier") in ("custom", "decisions", "gemini")]),
         "tier_vs_gold_when_rule_decided": agreement(
             [r for r in answered if r.get("X-Router-Classifier") == "rules"]),
     }

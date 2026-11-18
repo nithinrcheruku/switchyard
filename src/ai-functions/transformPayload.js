@@ -1417,6 +1417,23 @@ function runTransformPayload(context) {
     context.setVariable("request.header.Accept-Encoding", "identity");
   }
 
+  // Fast-path passthrough for Google Gemini Decisions API (POST /v1beta/decisions, gemini-decision-1)
+  if (clientProtocol === "gemini_decisions" || targetFamily === "gemini_decisions") {
+    var decisionsUrl =
+      context.getVariable("ai.decisionsApiUrl") ||
+      "https://generativelanguage.googleapis.com/v1beta/decisions";
+    if (body && typeof body === "object" && !body.model) {
+      body.model = vertexModelId || "gemini-decision-1";
+    }
+    context.setVariable("vertex_action", "decisions");
+    context.setVariable("ai.vertexAction", "decisions");
+    context.setVariable("ai.targetUrl", decisionsUrl);
+    var decisionsSerialized = JSON.stringify(body);
+    context.setVariable("transformed_payload", decisionsSerialized);
+    context.setVariable("request.content", decisionsSerialized);
+    return;
+  }
+
   // Fast-path passthrough when Antigravity calls a native Vertex Gemini model directly
   if (clientProtocol === "vertex_gemini" && targetFamily === "gemini") {
     if (body && typeof body === "object" && "model" in body) {

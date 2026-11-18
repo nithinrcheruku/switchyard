@@ -167,3 +167,15 @@ variable "tls_certificate_pem" {
   type        = string
   default     = ""
 }
+
+variable "enable_gemini_decisions_api" {
+  description = "Enable the Google Generative Language API (generativelanguage.googleapis.com) and provision the encrypted Apigee environment KVM for the Gemini Decisions API (gemini-decision-1)."
+  type        = bool
+  default     = false
+}
+
+variable "gemini_decisions_kvm_name" {
+  description = "Encrypted Apigee X environment KeyValueMap name holding the `gemini_decisions_api_key` entry when DecisionsAuthMode is api_key."
+  type        = string
+  default     = "switchyard-secrets"
+}

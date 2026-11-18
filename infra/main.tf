@@ -328,7 +328,7 @@ resource "google_apigee_api_product" "coding_agent_standard" {
   }
   attributes {
     name  = "allowedModels"
-    value = "gemini-3.8-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-3.5-flash-lite,gemini-3.1-flash-lite-preview,gemini-3.1-pro-preview,gemini-3.1-pro,gemini-2.5-pro,gemini-2.5-flash,claude-sonnet-5-5,claude-sonnet-4-6,claude-haiku-5-5,claude-haiku-4-5,qwen3-coder,qwen3-next-80b-thinking,deepseek-v4.1-flash,deepseek-v3.2,deepseek-r1,glm-5,glm-5.2,kimi-k2,kimi-k2.6,llama-4-maverick,llama-4-scout,gpt-oss-120b,gemma-4-26b,minimax-m2,mistral-medium-3,codestral-2,grok-4.7,muse-spark,smart-router,auto,switchyard-auto"
+    value = "gemini-3.8-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-3.5-flash-lite,gemini-3.1-flash-lite-preview,gemini-3.1-pro-preview,gemini-3.1-pro,gemini-2.5-pro,gemini-2.5-flash,gemini-decision-1,claude-sonnet-5-5,claude-sonnet-4-6,claude-haiku-5-5,claude-haiku-4-5,qwen3-coder,qwen3-next-80b-thinking,deepseek-v4.1-flash,deepseek-v3.2,deepseek-r1,glm-5,glm-5.2,kimi-k2,kimi-k2.6,llama-4-maverick,llama-4-scout,gpt-oss-120b,gemma-4-26b,minimax-m2,mistral-medium-3,codestral-2,grok-4.7,muse-spark,smart-router,auto,switchyard-auto"
   }
   attributes {
     name  = "tierName"
@@ -379,7 +379,7 @@ resource "google_apigee_api_product" "coding_agent_frontier" {
   }
   attributes {
     name  = "allowedModels"
-    value = "gemini-4-argon,gemini-3.8-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-3.5-flash-lite,gemini-3.1-flash-lite-preview,gemini-3.1-pro-preview,gemini-3.1-pro,gemini-2.5-pro,gemini-2.5-flash,claude-opus-5-5,claude-opus-4-8,claude-opus-4-7,claude-opus-4-6,claude-fable-5-1,claude-sonnet-5-5,claude-sonnet-4-6,claude-haiku-5-5,claude-haiku-4-5,qwen3-coder,qwen3-next-80b-thinking,deepseek-v4.1-flash,deepseek-v3.2,deepseek-r1,glm-5,glm-5.2,kimi-k2,kimi-k2.6,llama-4-maverick,llama-4-scout,gpt-oss-120b,gemma-4-26b,minimax-m2,mistral-medium-3,codestral-2,grok-4.7,muse-spark,smart-router,auto,switchyard-auto"
+    value = "gemini-4-argon,gemini-3.8-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-3.5-flash-lite,gemini-3.1-flash-lite-preview,gemini-3.1-pro-preview,gemini-3.1-pro,gemini-2.5-pro,gemini-2.5-flash,gemini-decision-1,claude-opus-5-5,claude-opus-4-8,claude-opus-4-7,claude-opus-4-6,claude-fable-5-1,claude-sonnet-5-5,claude-sonnet-4-6,claude-haiku-5-5,claude-haiku-4-5,qwen3-coder,qwen3-next-80b-thinking,deepseek-v4.1-flash,deepseek-v3.2,deepseek-r1,glm-5,glm-5.2,kimi-k2,kimi-k2.6,llama-4-maverick,llama-4-scout,gpt-oss-120b,gemma-4-26b,minimax-m2,mistral-medium-3,codestral-2,grok-4.7,muse-spark,smart-router,auto,switchyard-auto"
   }
   attributes {
     name  = "tierName"
@@ -992,5 +992,29 @@ resource "google_project_iam_audit_config" "vertex_data_access" {
   audit_log_config {
     log_type = "DATA_WRITE"
   }
+}
+
+# ------------------------------------------------------------------------------
+# 9. Optional Gemini Decisions API (gemini-decision-1) Enablement & Encrypted KVM
+#    Populates the `switchyard-secrets` Apigee environment KVM container; populate
+#    the `gemini_decisions_api_key` entry out-of-band via Apigee KVM Entries API
+#    so API keys never enter Terraform state.
+# ------------------------------------------------------------------------------
+resource "google_project_service" "generative_language_api" {
+  count              = var.enable_gemini_decisions_api ? 1 : 0
+  project            = var.project_id
+  service            = "generativelanguage.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_apigee_env_keyvaluemap" "decisions_secrets" {
+  count  = var.enable_gemini_decisions_api ? 1 : 0
+  env_id = "${local.apigee_org_id}/environments/${var.apigee_env}"
+  name   = var.gemini_decisions_kvm_name
+
+  depends_on = [
+    google_apigee_environment.env,
+    google_project_service.generative_language_api,
+  ]
 }
 

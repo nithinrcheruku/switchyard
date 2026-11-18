@@ -133,7 +133,19 @@ function parseBackendUnaryResponse(body, targetFamily) {
 
   if (!body || typeof body !== "object") return result;
 
-  if (targetFamily === "gemini") {
+  if (targetFamily === "gemini_decisions") {
+    var dUsage = body.usage && typeof body.usage === "object" ? body.usage : {};
+    result.inputTokens = Number(dUsage.total_input_tokens || dUsage.total_tokens || 0);
+    // Gemini Decision 1 always generates 0 output tokens.
+    result.outputTokens = Number(dUsage.total_output_tokens || 0);
+    result.thoughtsTokens = 0;
+    result.cachedInputTokens = Number(dUsage.total_cached_tokens || 0);
+    if (body.prompt_feedback && body.prompt_feedback.block_reason) {
+      result.stopReason = "refusal";
+      result.openaiFinishReason = "content_filter";
+      result.geminiFinishReason = "SAFETY";
+    }
+  } else if (targetFamily === "gemini") {
     var cand = body.candidates && body.candidates[0];
     var latestThoughtSig = null;
     if (cand && cand.content && Array.isArray(cand.content.parts)) {
@@ -742,7 +754,7 @@ function runTransformResponseAndCost(context) {
   context.setVariable("response.header.X-Gateway-Environment", String(envNameEarly));
 
   // Smart Router classifier attribution. Only set when `model: auto` ran the router:
-  //   X-Router-Classifier      rules | custom | gemini | length-fallback
+  //   X-Router-Classifier      rules | custom | decisions | gemini | length-fallback
   //   X-Router-Classifier-Ms   time the classifier callout added inside the gateway (0 = none
   //                            made). Absent when the proxy has no JS-PrepareSmartJudge step,
   //                            because nothing timed the callout.
@@ -774,7 +786,7 @@ function runTransformResponseAndCost(context) {
   }
 
   var fundingPoolEarly =
-    targetFamily === "gemini"
+    targetFamily === "gemini" || targetFamily === "gemini_decisions"
       ? "ANTIGRAVITY_GEMINI_CREDITS"
       : "GCP_COMMIT_FSP_DISCOUNT";
   context.setVariable("response.header.x-vertex-funding-pool", String(fundingPoolEarly));
@@ -874,7 +886,7 @@ function runTransformResponseAndCost(context) {
       ? ((routingSavingsUsd / frontierBaselineCostUsd) * 100.0).toFixed(1)
       : "0.0";
   var fundingPool =
-    targetFamily === "gemini"
+    targetFamily === "gemini" || targetFamily === "gemini_decisions"
       ? "ANTIGRAVITY_GEMINI_CREDITS"
       : "GCP_COMMIT_FSP_DISCOUNT";
   var fspDiscountPct = parseFloat(context.getVariable("org_fsp_discount_pct") || "15.0");
@@ -1140,7 +1152,18 @@ function runTransformResponseAndCost(context) {
         budget_action: String(budgetAction),
         smart_router_decision: String(routerDecision),
         router_classifier: String(context.getVariable("ai.routerClassifier") || ""),
+        router_classifier_model: String(context.getVariable("ai.routerClassifierModel") || ""),
+        router_classifier_confidence: String(
+          context.getVariable("ai.routerClassifierConfidence") || ""
+        ),
         router_classifier_ms: routerClassifierMsLog,
+        router_classifier_input_tokens: parseInt(
+          context.getVariable("ai.routerClassifierInputTokens") || "0",
+          10
+        ) || 0,
+        router_classifier_cost_usd: parseFloat(
+          context.getVariable("ai.routerClassifierCostUsd") || "0"
+        ) || 0,
         funding_pool: String(fundingPool),
         ttft_ms: Number(ttftMs),
         total_latency_ms: Number(totalLatencyMs),
@@ -1257,7 +1280,8 @@ function runTransformResponseAndCost(context) {
     isStreaming ||
     isSsePayload ||
     (clientProtocol === "vertex_gemini" && targetFamily === "gemini") ||
-    (clientProtocol === "anthropic_messages" && targetFamily === "anthropic")
+    (clientProtocol === "anthropic_messages" && targetFamily === "anthropic") ||
+    (clientProtocol === "gemini_decisions" && targetFamily === "gemini_decisions")
   ) {
     return;
   }

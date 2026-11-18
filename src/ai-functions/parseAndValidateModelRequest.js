@@ -149,6 +149,15 @@ var MODEL_CATALOG = {
     inputCostPer1M: 1.25,
     outputCostPer1M: 5.00
   },
+  "gemini-decision-1": {
+    canonicalId: "gemini-decision-1",
+    vertexModelId: "gemini-decision-1",
+    family: "gemini_decisions",
+    tier: "tier1-fast",
+    region: "global",
+    inputCostPer1M: 0.10,
+    outputCostPer1M: 0.00
+  },
 
   // ── Anthropic Claude Partner Models on Google Cloud ──────────────────────────
   "claude-opus-5-5": {
@@ -1467,6 +1476,19 @@ function extractPromptSnippet(body, protocol) {
         }
       }
     }
+  } else if (protocol === "gemini_decisions") {
+    if (typeof body.input === "string") {
+      parts.push(body.input);
+    } else if (Array.isArray(body.input)) {
+      for (var di = 0; di < body.input.length; di++) {
+        var dblk = body.input[di];
+        if (dblk && typeof dblk.text === "string") {
+          parts.push(dblk.text);
+        }
+      }
+    } else if (body.input && typeof body.input === "object" && typeof body.input.text === "string") {
+      parts.push(body.input.text);
+    }
   } else if (protocol === "vertex_gemini") {
     var contents = body.contents || [];
     for (var c = 0; c < contents.length; c++) {
@@ -1659,6 +1681,8 @@ function extractLatestUserPrompt(body, protocol) {
       }
     }
     if (sawToolResult) return "(tool_result_followup)";
+  } else if (protocol === "gemini_decisions") {
+    return cleanUserPromptEnvelope(extractPromptSnippet(body, protocol));
   } else if (protocol === "vertex_gemini") {
     var contents = body.contents || [];
     for (i = contents.length - 1; i >= 0; i--) {
@@ -1680,6 +1704,7 @@ function extractLatestUserPrompt(body, protocol) {
 
 function isSingleTurnCacheEligible(body, protocol) {
   if (!body || typeof body !== "object") return false;
+  if (protocol === "gemini_decisions") return false;
   if (Array.isArray(body.tools) && body.tools.length > 0) return false;
   if (protocol === "anthropic_messages" || protocol === "openai_chat") {
     var msgs = body.messages || [];
@@ -2120,6 +2145,14 @@ function runParseAndValidateModelRequest(context) {
   ) {
     context.setVariable("gcp_project_id", String(properties.gcpProjectId));
   }
+  if (
+    !context.getVariable("ai.decisionsApiUrl") &&
+    typeof properties !== "undefined" &&
+    properties &&
+    properties.decisionsApiUrl
+  ) {
+    context.setVariable("ai.decisionsApiUrl", String(properties.decisionsApiUrl));
+  }
   var gatewayReqSeed =
     String(nowStartMs) +
     ":" +
@@ -2415,6 +2448,19 @@ function runParseAndValidateModelRequest(context) {
     } else if (afterAnthropicModels) {
       requestedModel = afterAnthropicModels;
     }
+  } else if (
+    pathSuffix === "/v1beta/decisions" ||
+    pathSuffix === "/v1beta/decisions/" ||
+    rawSuffixOnly === "/v1beta/decisions" ||
+    rawSuffixOnly === "/v1beta/decisions/" ||
+    (basePath === "/v1beta" &&
+      (rawSuffixOnly === "/decisions" || rawSuffixOnly === "/decisions/"))
+  ) {
+    clientProtocol = "gemini_decisions";
+    codingHarness = "gemini-decisions";
+    requestedModel = body.model ? String(body.model).trim() : "gemini-decision-1";
+    isStreaming = false;
+    isCountTokens = false;
   } else if (
     pathSuffix.indexOf("/v1beta/models/") === 0 ||
     pathSuffix.indexOf("/v1beta1/") === 0 ||

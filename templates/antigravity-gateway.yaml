@@ -14,6 +14,9 @@ spec:
       routeRules:
         - name: antigravity-internal-noop
           condition: ai.isAntigravityTelemetry = "true" or ai.isCatalogOrFinopsRequest = "true" or proxy.pathsuffix MatchesPath "/v1beta:*" or proxy.pathsuffix MatchesPath "/v1internal*"
+        - name: route-to-gemini-decisions
+          condition: target_model_family = "gemini_decisions"
+          targetEndpoint: gemini-decisions-target
         - name: route-to-vertex-anthropic-stream
           condition: target_model_family = "anthropic" and is_streaming = "true"
           targetEndpoint: vertex-anthropic-stream-target
@@ -110,3 +113,21 @@ spec:
           request.streaming.enabled: "false"
           io.timeout.millis: "3600000"
           keepalive.timeout.millis: "3600000"
+
+    - name: gemini-decisions-target
+      disableVertexFallback: true
+      httpTargetConnection:
+        url: "{DecisionsApiUrl}"
+        authentication:
+          mode: "{DecisionsAuthMode}"
+          apiKeyHeader: x-goog-api-key
+          apiKeyValue: "{private.decisions.apiKey}"
+          userProjectHeader: "{GCPProjectId}"
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+            - https://www.googleapis.com/auth/generative-language.retriever
+        properties:
+          response.streaming.enabled: "false"
+          request.streaming.enabled: "false"
+          io.timeout.millis: "30000"
+          keepalive.timeout.millis: "30000"

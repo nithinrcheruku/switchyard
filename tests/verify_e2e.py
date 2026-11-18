@@ -2820,6 +2820,417 @@ def run_all_suites(client):
             "; ".join(params_detail) or "no parameter files found",
         )
 
+        print("\n--- SUITE 12: Gemini Decisions API (gemini-decision-1) Smart Router & Direct Endpoint ---")
+
+        def decisions_headers(response_json, backend="decisions", extra=None):
+            hdrs = {"X-Router-Classifier": backend}
+            if response_json is not None:
+                hdrs["X-Test-Decisions-Classifier-Response"] = response_json
+            if extra:
+                hdrs.update(extra)
+            return hdrs
+
+        # DEC-1: Rule-first still wins when backend=decisions (0 ms, no Decisions API callout).
+        st, hdr, raw = auto_turn(
+            "Write unit_test boilerplate and regex parser helper in Python.",
+            STD_API_KEY,
+            decisions_headers(
+                json.dumps(
+                    {
+                        "answers": {
+                            "routing_tier": {
+                                "type": "choice",
+                                "choice": "tier3-frontier",
+                                "confidence": 0.99,
+                                "probabilities": {"tier3-frontier": 0.99, "tier4-open": 0.01},
+                            }
+                        }
+                    }
+                )
+            ),
+        )
+        check(
+            "DEC-1: backend=decisions keeps rule-first 0 ms speed when a deterministic rule matches",
+            st == 200
+            and hdr.get("X-Vertex-Target-Tier") == "tier4-open"
+            and hdr.get("X-Router-Classifier") == "rules"
+            and hdr.get("X-Router-Classifier-Ms") == "0",
+            f"{st} {hdr} {raw}",
+        )
+
+        # DEC-2: Decisions API choice answer routes cleanly with calibrated confidence & headers.
+        dec_choice_resp = json.dumps(
+            {
+                "answers": {
+                    "routing_tier": {
+                        "type": "choice",
+                        "choice": "tier2-daily",
+                        "confidence": 0.942,
+                        "probabilities": {
+                            "tier1-fast": 0.012,
+                            "tier2-daily": 0.942,
+                            "tier3-frontier": 0.026,
+                            "tier4-open": 0.020,
+                        },
+                    },
+                    "needs_deep_reasoning": {
+                        "type": "noul",
+                        "noul": 0.11,
+                        "confidence": 0.89,
+                    },
+                },
+                "usage": {
+                    "total_input_tokens": 185,
+                    "input_tokens_by_modality": [{"modality": "text", "tokens": 185}],
+                    "total_output_tokens": 0,
+                    "total_tokens": 185,
+                },
+            }
+        )
+        st, hdr, raw = auto_turn(no_rule_prompt, STD_API_KEY, decisions_headers(dec_choice_resp))
+        check(
+            "DEC-2: backend=decisions parses routing_tier choice, confidence, and attributes gemini-decision-1",
+            st == 200
+            and hdr.get("X-Vertex-Target-Tier") == "tier2-daily"
+            and hdr.get("X-Router-Classifier") == "decisions"
+            and hdr.get("X-Router-Classifier-Model") == "gemini-decision-1"
+            and hdr.get("X-Router-Classifier-Confidence") == "0.942"
+            and "decisions:gemini-decision-1->tier2-daily" in hdr.get("X-Smart-Router-Decision", ""),
+            f"{st} {hdr} {raw}",
+        )
+
+        # DEC-3: Low-confidence calibrated thresholding escalates conservatively to tier2-daily.
+        dec_low_conf_resp = json.dumps(
+            {
+                "answers": {
+                    "routing_tier": {
+                        "type": "choice",
+                        "choice": "tier1-fast",
+                        "confidence": 0.34,
+                        "probabilities": {
+                            "tier1-fast": 0.34,
+                            "tier2-daily": 0.31,
+                            "tier3-frontier": 0.20,
+                            "tier4-open": 0.15,
+                        },
+                    }
+                },
+                "usage": {"total_input_tokens": 140, "total_output_tokens": 0, "total_tokens": 140},
+            }
+        )
+        st, hdr, raw = auto_turn(no_rule_prompt, STD_API_KEY, decisions_headers(dec_low_conf_resp))
+        check(
+            "DEC-3: low-confidence Decisions API split (<0.50) safely escalates to tier2-daily instead of under-routing",
+            st == 200
+            and hdr.get("X-Vertex-Target-Tier") == "tier2-daily"
+            and hdr.get("X-Router-Classifier") == "decisions"
+            and hdr.get("X-Router-Classifier-Confidence") == "0.34"
+            and "decisions:low_confidence(0.34)->tier2-daily" in hdr.get("X-Smart-Router-Decision", ""),
+            f"{st} {hdr} {raw}",
+        )
+
+        # DEC-4: Parallel `needs_deep_reasoning` (noul) escalates borderline choices to tier3-frontier
+        # for frontier keys and still respects RBAC capping on standard keys.
+        dec_noul_escalate_resp = json.dumps(
+            {
+                "answers": {
+                    "routing_tier": {
+                        "type": "choice",
+                        "choice": "tier2-daily",
+                        "confidence": 0.62,
+                        "probabilities": {
+                            "tier1-fast": 0.02,
+                            "tier2-daily": 0.62,
+                            "tier3-frontier": 0.34,
+                            "tier4-open": 0.02,
+                        },
+                    },
+                    "needs_deep_reasoning": {
+                        "type": "noul",
+                        "noul": 0.91,
+                        "confidence": 0.91,
+                    },
+                },
+                "usage": {"total_input_tokens": 190, "total_output_tokens": 0, "total_tokens": 190},
+            }
+        )
+        st_frt, hdr_frt, raw_frt = auto_turn(
+            no_rule_prompt, FRONTIER_API_KEY, decisions_headers(dec_noul_escalate_resp)
+        )
+        st_std, hdr_std, raw_std = auto_turn(
+            no_rule_prompt, STD_API_KEY, decisions_headers(dec_noul_escalate_resp)
+        )
+        check(
+            "DEC-4: parallel needs_deep_reasoning (noul>=0.85) escalates borderline prompts to tier3-frontier and obeys RBAC capping",
+            st_frt == 200
+            and hdr_frt.get("X-Vertex-Target-Tier") == "tier3-frontier"
+            and hdr_frt.get("X-Router-Classifier") == "decisions"
+            and "(escalated)" in hdr_frt.get("X-Smart-Router-Decision", "")
+            and st_std == 200
+            and hdr_std.get("X-Vertex-Target-Tier") == "tier2-daily"
+            and "rbac_capped" in hdr_std.get("X-Smart-Router-Decision", ""),
+            f"frt={st_frt} {hdr_frt} std={st_std} {hdr_std}",
+        )
+
+        # DEC-5: Score answer format maps discrete argmax level to tier.
+        dec_score_resp = json.dumps(
+            {
+                "answers": {
+                    "routing_tier": {
+                        "type": "score",
+                        "score": 1.08,
+                        "legend": {"0": "Simple", "1": "Medium", "2": "Complex", "3": "Reasoning"},
+                        "probabilities": {"0": 0.04, "1": 0.84, "2": 0.10, "3": 0.02},
+                        "confidence": 0.84,
+                    }
+                },
+                "usage": {"total_input_tokens": 160, "total_output_tokens": 0, "total_tokens": 160},
+            }
+        )
+        st, hdr, raw = auto_turn(no_rule_prompt, STD_API_KEY, decisions_headers(dec_score_resp))
+        check(
+            "DEC-5: Decisions API score answer picks highest-probability discrete level (level 1 -> tier4-open)",
+            st == 200
+            and hdr.get("X-Vertex-Target-Tier") == "tier4-open"
+            and hdr.get("X-Router-Classifier") == "decisions"
+            and hdr.get("X-Router-Classifier-Confidence") == "0.84",
+            f"{st} {hdr} {raw}",
+        )
+
+        # DEC-6: backend=decisions-only bypasses deterministic keyword rules so gemini-decision-1
+        # classifies even rule-matching prompts directly.
+        dec_only_resp = json.dumps(
+            {
+                "answers": {
+                    "routing_tier": {
+                        "type": "choice",
+                        "choice": "tier2-daily",
+                        "confidence": 0.88,
+                        "probabilities": {
+                            "tier1-fast": 0.02,
+                            "tier2-daily": 0.88,
+                            "tier3-frontier": 0.05,
+                            "tier4-open": 0.05,
+                        },
+                    }
+                },
+                "usage": {"total_input_tokens": 150, "total_output_tokens": 0, "total_tokens": 150},
+            }
+        )
+        st, hdr, raw = auto_turn(
+            "Write unit_test boilerplate and regex parser helper in Python.",
+            STD_API_KEY,
+            decisions_headers(dec_only_resp, backend="decisions-only"),
+        )
+        check(
+            "DEC-6: backend=decisions-only bypasses deterministic keyword rules and classifies via Decisions API",
+            st == 200
+            and hdr.get("X-Vertex-Target-Tier") == "tier2-daily"
+            and hdr.get("X-Router-Classifier") == "decisions"
+            and hdr.get("X-Router-Classifier-Model") == "gemini-decision-1",
+            f"{st} {hdr} {raw}",
+        )
+
+        # DEC-7: Safety blocks, API errors, unknown choices, malformed JSON, or unreachable endpoint
+        # fail open safely to length-fallback (HTTP 200).
+        bad_decisions = {
+            "safety_block": json.dumps({"prompt_feedback": {"block_reason": "safety"}, "answers": {}}),
+            "api_error": json.dumps({"error": {"code": "safety", "message": "Request blocked"}}),
+            "unknown_choice": json.dumps(
+                {"answers": {"routing_tier": {"type": "choice", "choice": "tier9-ultra", "confidence": 0.99}}}
+            ),
+            "malformed": "{not-valid-json",
+            "unreachable": None,
+        }
+        bad_results = {}
+        for case, payload in bad_decisions.items():
+            st, hdr, raw = auto_turn(no_rule_prompt, FRONTIER_API_KEY, decisions_headers(payload))
+            bad_results[case] = (st, hdr.get("X-Router-Classifier"), hdr.get("X-Vertex-Target-Tier"))
+        check(
+            "DEC-7: safety-blocked, error, unknown, malformed, or unreachable Decisions API fails open to length-fallback",
+            all(v == (200, "length-fallback", "tier1-fast") for v in bad_results.values()),
+            f"{bad_results}",
+        )
+
+        # DEC-8: Direct governed POST /v1beta/decisions endpoint (multi-question noul + choice + score,
+        # auth enforcement, 0 output tokens, $0.10/1M FinOps attribution).
+        direct_dec_req = {
+            "model": "gemini-decision-1",
+            "input": "Production API requests have been failing with 503 errors for 20 minutes!",
+            "questions": {
+                "is_outage": {
+                    "type": "noul",
+                    "instructions": "Determine whether this message reports an active production outage.",
+                },
+                "priority": {
+                    "type": "choice",
+                    "instructions": "Select the incident priority.",
+                    "criteria": {
+                        "p1_critical": "Production outage blocking traffic with 503 errors.",
+                        "p2_high": "Major feature degraded with workaround.",
+                        "p3_normal": "General question or cosmetic bug.",
+                    },
+                },
+                "urgency": {
+                    "type": "score",
+                    "instructions": "Rate immediate escalation urgency.",
+                    "criteria": ["Routine inquiry", "Same-day follow-up", "Immediate escalation"],
+                },
+            },
+        }
+        st_unauth, _, _ = client.request("POST", "/v1beta/decisions", {}, direct_dec_req)
+        st_dec, hdr_dec, raw_dec = client.request(
+            "POST",
+            "/v1beta/decisions",
+            {"x-goog-api-key": STD_API_KEY},
+            direct_dec_req,
+        )
+        dec_body = json.loads(raw_dec) if st_dec == 200 else {}
+        dec_answers = dec_body.get("answers") or {}
+        dec_usage = dec_body.get("usage") or {}
+        check(
+            "DEC-8: direct POST /v1beta/decisions enforces auth, evaluates noul+choice+score with 0 output tokens and FinOps attribution",
+            st_unauth == 401
+            and st_dec == 200
+            and hdr_dec.get("X-Vertex-Target-Model") == "gemini-decision-1"
+            and dec_answers.get("is_outage", {}).get("type") == "noul"
+            and 0.01 <= float(dec_answers.get("is_outage", {}).get("noul", 0)) <= 0.99
+            and dec_answers.get("priority", {}).get("type") == "choice"
+            and dec_answers.get("priority", {}).get("choice") == "p1_critical"
+            and dec_answers.get("urgency", {}).get("type") == "score"
+            and dec_usage.get("total_output_tokens") == 0
+            and int(dec_usage.get("total_input_tokens") or 0) > 0,
+            f"unauth={st_unauth} st={st_dec} hdr={hdr_dec} body={dec_body}",
+        )
+
+        # DEC-9: Apigee XML bundle compilation with stages/params/decisions-router.json (api_key mode)
+        # AND DecisionsAuthMode=oauth mode across all 3 proxies + antigravity gemini-decisions-target.
+        dec_env = os.environ.copy()
+        dec_env["STAGE_PARAMS"] = "stages/params/decisions-router.json"
+        res_dec07 = subprocess.run(
+            ["./deploy.sh", "--stage", "07-mvp-pilot", "--build-only"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=dec_env,
+        )
+        bundle_checks_ok = res_dec07.returncode == 0
+        bundle_detail = [f"api_key rc={res_dec07.returncode} {res_dec07.stderr[-200:]}"]
+        if bundle_checks_ok:
+            for proxy in ("claude-code-gateway", "antigravity-gateway", "codex-gateway"):
+                with zipfile.ZipFile(f"build/07-mvp-pilot/{proxy}.zip") as zf:
+                    flow = ET.fromstring(zf.read("apiproxy/proxies/default.xml"))
+                    pre = [s.findtext("Name") for s in flow.findall("./PreFlow/Request/Step")]
+                    conds = {
+                        s.findtext("Name"): s.findtext("Condition") or ""
+                        for s in flow.findall("./PreFlow/Request/Step")
+                    }
+                    sc_dec = ET.fromstring(zf.read("apiproxy/policies/SC-DecisionsClassifier.xml"))
+                    kvm_dec = ET.fromstring(zf.read("apiproxy/policies/KVM-GetDecisionsApiKey.xml"))
+                    js_prep = ET.fromstring(zf.read("apiproxy/policies/JS-PrepareSmartJudge.xml"))
+                    prep_props = {p.attrib.get("name"): p.text for p in js_prep.findall("./Properties/Property")}
+                    sc_payload_str = sc_dec.findtext("./Request/Set/Payload") or ""
+                    sc_payload = json.loads(sc_payload_str)
+                    sc_hdrs = {
+                        h.attrib.get("name"): h.text
+                        for h in sc_dec.findall("./Request/Set/Headers/Header")
+                    }
+                    ok_proxy = (
+                        pre.index("JS-PrepareSmartJudge")
+                        < pre.index("SC-ModelJudge")
+                        < pre.index("SC-CustomClassifier")
+                        < pre.index("KVM-GetDecisionsApiKey")
+                        < pre.index("SC-DecisionsClassifier")
+                        < pre.index("JS-ApplySmartJudgeSelection")
+                        and 'ai.judgeBackend != "decisions"' in conds["SC-ModelJudge"]
+                        and 'ai.judgeBackend = "decisions"' in conds["SC-DecisionsClassifier"]
+                        and prep_props.get("judgeBackend") == "decisions"
+                        and sc_dec.findtext("./HTTPTargetConnection/URL")
+                        == "https://generativelanguage.googleapis.com/v1beta/decisions"
+                        and sc_dec.find("./HTTPTargetConnection/Authentication") is None
+                        and sc_hdrs.get("x-goog-api-key") == "{private.decisions.apiKey}"
+                        and kvm_dec.attrib.get("mapIdentifier") == "switchyard-secrets"
+                        and sc_payload.get("model") == "gemini-decision-1"
+                        and sc_payload.get("questions", {}).get("routing_tier", {}).get("type") == "choice"
+                        and sc_payload.get("questions", {}).get("needs_deep_reasoning", {}).get("type") == "noul"
+                    )
+                    if proxy == "antigravity-gateway":
+                        tgt_dec = ET.fromstring(zf.read("apiproxy/targets/gemini-decisions-target.xml"))
+                        tgt_steps = [s.findtext("Name") for s in tgt_dec.findall("./PreFlow/Request/Step")]
+                        tgt_faults = [f.attrib.get("name") for f in tgt_dec.findall("./FaultRules/FaultRule")]
+                        ok_proxy = (
+                            ok_proxy
+                            and tgt_dec.findtext("./HTTPTargetConnection/URL")
+                            == "https://generativelanguage.googleapis.com/v1beta/decisions"
+                            and "KVM-GetDecisionsApiKey" in tgt_steps
+                            and "AM-InjectDecisionsTargetAuth" in tgt_steps
+                            and "VertexModelGardenFailoverRule" not in tgt_faults
+                        )
+                    bundle_checks_ok = bundle_checks_ok and ok_proxy
+                    if not ok_proxy:
+                        bundle_detail.append(f"failed proxy={proxy}")
+
+        oauth_env = os.environ.copy()
+        oauth_env["STAGE_PARAMS"] = json.dumps({"JudgeBackend": "decisions", "DecisionsAuthMode": "oauth"})
+        res_oauth = subprocess.run(
+            ["./deploy.sh", "--stage", "07-mvp-pilot", "--build-only"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=oauth_env,
+        )
+        oauth_ok = res_oauth.returncode == 0
+        if oauth_ok:
+            with zipfile.ZipFile("build/07-mvp-pilot/claude-code-gateway.zip") as zf:
+                sc_oauth = ET.fromstring(zf.read("apiproxy/policies/SC-DecisionsClassifier.xml"))
+                scopes = [s.text for s in sc_oauth.findall("./HTTPTargetConnection/Authentication/GoogleAccessToken/Scopes/Scope")]
+                oauth_hdrs = {
+                    h.attrib.get("name"): h.text
+                    for h in sc_oauth.findall("./Request/Set/Headers/Header")
+                }
+                oauth_ok = (
+                    "https://www.googleapis.com/auth/generative-language.retriever" in scopes
+                    and "x-goog-user-project" in oauth_hdrs
+                    and "x-goog-api-key" not in oauth_hdrs
+                )
+        # Re-compile default 07-mvp-pilot cleanly so build/ is left in its default state.
+        subprocess.run(
+            ["./deploy.sh", "--stage", "07-mvp-pilot", "--build-only"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        check(
+            "DEC-9: deploy.sh compiles Decisions API policies cleanly for both api_key (encrypted KVM) and oauth modes across all 3 proxies",
+            bundle_checks_ok and oauth_ok,
+            "; ".join(bundle_detail) + f"; oauth_ok={oauth_ok}",
+        )
+
+        # DEC-10: tests/bench_decisions_api.py --dry-run validates payload against routing_eval.jsonl.
+        res_bench = subprocess.run(
+            [sys.executable, "tests/bench_decisions_api.py", "--dry-run", "--limit", "5"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        bench_ok = res_bench.returncode == 0
+        if bench_ok:
+            try:
+                bench_out = json.loads(res_bench.stdout)
+                bench_ok = (
+                    bench_out.get("dry_run") is True
+                    and bench_out.get("rows") == 5
+                    and bench_out.get("sample_request", {}).get("model") == "gemini-decision-1"
+                    and "routing_tier" in bench_out.get("sample_request", {}).get("questions", {})
+                )
+            except Exception:
+                bench_ok = False
+        check(
+            "DEC-10: tests/bench_decisions_api.py --dry-run emits valid Gemini Decisions API benchmark payloads",
+            bench_ok,
+            f"rc={res_bench.returncode} out={res_bench.stdout[:200]} err={res_bench.stderr[:200]}",
+        )
+
     print(f"\n==================================================================")
     print(f" ALL {passed}/{total} E2E VERIFICATION CHECKS PASSED SUCCESSFULLY!")
     print(f"==================================================================")

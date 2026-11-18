@@ -31,6 +31,33 @@ defaultParameters:
     value: google/gemini-3.1-pro-preview
   - name: FinopsIngestionMode
     value: USAGE
+  # Gemini Decisions API (v1beta) defaults — shared by direct POST /v1beta/decisions proxying
+  # and the Smart Router Decisions backend (features/ai-pluggable-classifier.yaml).
+  - name: DecisionsApiUrl
+    value: https://generativelanguage.googleapis.com/v1beta/decisions
+  - name: DecisionsModel
+    value: gemini-decision-1
+  # Authentication mode for generativelanguage.googleapis.com/v1beta/decisions:
+  #   api_key = reads x-goog-api-key from encrypted Apigee KVM (recommended for Gemini Developer API)
+  #   oauth   = mints GoogleAccessToken (cloud-platform + generative-language.retriever) + x-goog-user-project
+  - name: DecisionsAuthMode
+    value: api_key
+  - name: DecisionsApiKeyKvmMap
+    value: switchyard-secrets
+  - name: DecisionsApiKeyKvmEntry
+    value: gemini_decisions_api_key
+  # Calibrated confidence controls for Gemini Decisions API Smart Router classification:
+  #   DecisionsMinConfidence      below this threshold, low-certainty choice answers escalate to
+  #                               DecisionsLowConfidenceTier instead of trusting a noisy argmax.
+  #   DecisionsLowConfidenceTier  tier2-daily (safe default) or "fallback" (prompt-length fallback).
+  #   DecisionsEscalationThreshold  noul probability threshold on the parallel needs_deep_reasoning
+  #                                 question to escalate borderline prompts to tier3-frontier.
+  - name: DecisionsMinConfidence
+    value: "0.50"
+  - name: DecisionsLowConfidenceTier
+    value: tier2-daily
+  - name: DecisionsEscalationThreshold
+    value: "0.85"
 
 endpoints:
   - name: default
@@ -47,7 +74,7 @@ endpoints:
         # ai.judgeBackend is only set when features/ai-pluggable-classifier.yaml installs
         # JS-PrepareSmartJudge; without it the variable is null and the judge always runs.
         - name: SC-ModelJudge
-          condition: request.verb != "OPTIONS" and ai.useSmartJudge = "true" and ai.judgeBackend != "none" and ai.judgeBackend != "custom"
+          condition: request.verb != "OPTIONS" and ai.useSmartJudge = "true" and ai.judgeBackend != "none" and ai.judgeBackend != "custom" and ai.judgeBackend != "decisions"
         - name: JS-ApplySmartJudgeSelection
           condition: request.verb != "OPTIONS" and ai.useSmartJudge = "true"
         - name: JS-TransformPayload
@@ -62,6 +89,7 @@ steps:
       properties:
         gcpProjectId: "{GCPProjectId}"
         finopsIngestionMode: "{FinopsIngestionMode}"
+        decisionsApiUrl: "{DecisionsApiUrl}"
 
   - name: RF-BudgetExceeded
     type: RaiseFault
@@ -130,6 +158,11 @@ steps:
     properties:
       resourceURL: jsc://applySmartJudgeSelection.js
       timeLimit: 500
+      properties:
+        decisionsModel: "{DecisionsModel}"
+        decisionsMinConfidence: "{DecisionsMinConfidence}"
+        decisionsLowConfidenceTier: "{DecisionsLowConfidenceTier}"
+        decisionsEscalationThreshold: "{DecisionsEscalationThreshold}"
 
   - name: JS-TransformPayload
     type: JavaScript

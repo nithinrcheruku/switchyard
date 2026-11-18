@@ -3,13 +3,20 @@
  * Smart Router tier selection for `model: auto`. One file, two entry points:
  *
  *   JS-PrepareSmartJudge (policy property phase=prepare)
- *     Runs the deterministic rules first and decides whether a classifier callout is
- *     needed at all. A rule match, an empty prompt or the "heuristic" backend sets
- *     ai.judgeBackend = "none", so neither SC-ModelJudge nor SC-CustomClassifier fires.
+ *     Runs the deterministic rules first (unless judgeBackend is "decisions-only") and
+ *     decides whether a classifier callout is needed at all. A rule match, an empty prompt
+ *     or the "heuristic" backend sets ai.judgeBackend = "none", so no network callout fires.
+ *     Supported backends:
+ *       - "gemini"         Vertex AI LLM judge (SC-ModelJudge, gemini-3.5-flash-lite)
+ *       - "decisions"      Rule-first + Gemini Decisions API (SC-DecisionsClassifier, gemini-decision-1)
+ *       - "decisions-only" Pure Gemini Decisions API for all `model: auto` turns (skips keyword rules)
+ *       - "custom"         Bring-your-own HTTPS classifier (SC-CustomClassifier)
+ *       - "heuristic"      Deterministic rules + prompt-length fallback only (0 ms, no network)
  *
  *   JS-ApplySmartJudgeSelection (no phase property; also what the Node emulator calls)
- *     Picks the tier from, in order: a deterministic rule, the custom classifier response
- *     (SC-CustomClassifier), the LLM judge response (SC-ModelJudge), then the prompt-length
+ *     Picks the tier from, in order: a deterministic rule (unless decisions-only), the custom
+ *     classifier response (SC-CustomClassifier), the Gemini Decisions API response
+ *     (SC-DecisionsClassifier), the LLM judge response (SC-ModelJudge), then the prompt-length
  *     fallback, and resolves the Vertex AI Model Garden model within the developer's
  *     allowed RBAC tiers.
  *
@@ -17,6 +24,32 @@
  * and complexity labels (SIMPLE, MEDIUM, COMPLEX, REASONING).
  */
 var SMART_ROUTER_TIERS = ["tier1-fast", "tier2-daily", "tier3-frontier", "tier4-open"];
+var VALID_JUDGE_BACKENDS = ["gemini", "decisions", "decisions-only", "custom", "heuristic"];
+var MAX_DECISIONS_INPUT_CHARS = 16000;
+var DECISIONS_INPUT_COST_PER_1M_USD = 0.10;
+
+function escapeJsonStringValue(str) {
+  if (!str) return "";
+  var quoted = JSON.stringify(String(str));
+  return quoted.slice(1, -1);
+}
+
+function normalizeTierOrLabel(value) {
+  if (value === null || value === undefined) return "";
+  var raw = String(value).trim();
+  if (!raw) return "";
+  var lower = raw.toLowerCase();
+  if (SMART_ROUTER_TIERS.indexOf(lower) !== -1) {
+    return lower;
+  }
+  var labelToTier = {
+    SIMPLE: "tier1-fast",
+    MEDIUM: "tier4-open",
+    COMPLEX: "tier2-daily",
+    REASONING: "tier3-frontier"
+  };
+  return labelToTier[raw.toUpperCase()] || "";
+}
 
 /**
  * High-confidence deterministic domain & complexity signals (<1ms, no network).
@@ -165,7 +198,9 @@ function readSmartRouterPrompt(context) {
  * Phase 1 (JS-PrepareSmartJudge): decide which classifier callout, if any, should run.
  *
  * `props` are the policy <Properties>:
- *   judgeBackend             "gemini" (LLM judge), "custom" (SC-CustomClassifier) or
+ *   judgeBackend             "gemini" (LLM judge), "decisions" (rule-first + Decisions API),
+ *                            "decisions-only" (pure Decisions API, bypasses keyword rules),
+ *                            "custom" (SC-CustomClassifier) or
  *                            "heuristic" (rules + length fallback only, no callout)
  *   allowClassifierOverride  "true" lets the X-Router-Classifier request header choose the
  *                            backend per request. For benchmarking environments only.
@@ -173,30 +208,41 @@ function readSmartRouterPrompt(context) {
 function runPrepareSmartJudge(context, props) {
   props = props || {};
   var promptText = readSmartRouterPrompt(context);
-  var backend = String(props.judgeBackend || "gemini").toLowerCase();
+  var backend = String(props.judgeBackend || "gemini").toLowerCase().trim();
   if (String(props.allowClassifierOverride || "").toLowerCase() === "true") {
     var requested = String(
       context.getVariable("request.header.x-router-classifier") ||
         context.getVariable("request.header.X-Router-Classifier") ||
         ""
-    ).toLowerCase();
-    if (requested === "gemini" || requested === "custom" || requested === "heuristic") {
+    )
+      .toLowerCase()
+      .trim();
+    if (VALID_JUDGE_BACKENDS.indexOf(requested) !== -1) {
       backend = requested;
     }
   }
-  if (backend !== "gemini" && backend !== "custom" && backend !== "heuristic") {
+  if (VALID_JUDGE_BACKENDS.indexOf(backend) === -1) {
     backend = "gemini";
   }
 
-  var rules = evaluateSmartRouterRules(promptText);
-  var callout = backend;
-  if (rules.matched || backend === "heuristic" || !String(promptText).replace(/\s+/g, "")) {
+  var skipRules = backend === "decisions-only";
+  var rules = skipRules
+    ? { matched: false }
+    : evaluateSmartRouterRules(promptText);
+  var hasPrompt = Boolean(String(promptText).replace(/\s+/g, ""));
+  var callout = backend === "decisions-only" ? "decisions" : backend;
+  if (!hasPrompt || backend === "heuristic" || (!skipRules && rules.matched)) {
     // A rule already decides (or there is nothing to classify): skip the network hop.
     callout = "none";
   }
+
+  // Bounded JSON-escaped shared input for SC-DecisionsClassifier (well within 262,144 tokens).
+  var boundedInput = String(promptText || "").slice(0, MAX_DECISIONS_INPUT_CHARS);
+  context.setVariable("ai.decisionsInput", escapeJsonStringValue(boundedInput));
+  context.setVariable("ai.decisionsSkipRules", skipRules ? "true" : "false");
   context.setVariable("ai.judgeBackendConfigured", backend);
   context.setVariable("ai.judgeBackend", callout);
-  context.setVariable("ai.judgeRuleMatched", rules.matched ? "true" : "false");
+  context.setVariable("ai.judgeRuleMatched", !skipRules && rules.matched ? "true" : "false");
   context.setVariable("ai.judgeStartMs", String(new Date().getTime()));
 }
 
@@ -207,20 +253,234 @@ function sanitizeClassifierName(value) {
     .slice(0, 64);
 }
 
-function runApplySmartJudgeSelection(context) {
+/**
+ * Parse a Google Gemini Decisions API (POST /v1beta/decisions) response into a validated
+ * Smart Router tier decision.
+ *
+ * Official response contract:
+ *   {
+ *     "answers": {
+ *       "routing_tier": { "type": "choice", "choice": "tier2-daily", "confidence": 0.92, "probabilities": {...} },
+ *       "needs_deep_reasoning": { "type": "noul", "noul": 0.12, "confidence": 0.88 }
+ *     },
+ *     "usage": { "total_input_tokens": 180, "total_output_tokens": 0, "total_tokens": 180 },
+ *     "prompt_feedback": { "block_reason": "safety" } // optional; if set, answers is empty
+ *   }
+ *
+ * Also supports score-type routing answers (argmax discrete level -> tier1/4/2/3).
+ * Returns null on error, safety block, malformed JSON, or invalid tier so the caller
+ * fails open to prompt-length fallback.
+ */
+function parseDecisionsApiResponse(raw, opts) {
+  if (!raw) return null;
+  opts = opts || {};
+  var parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (parsed.error) return null;
+  if (parsed.prompt_feedback && parsed.prompt_feedback.block_reason) return null;
+
+  var answers = parsed.answers;
+  if (!answers || typeof answers !== "object" || Array.isArray(answers)) return null;
+
+  var tierAnswer = answers.routing_tier || null;
+  if (!tierAnswer || typeof tierAnswer !== "object") {
+    var aKeys = Object.keys(answers);
+    for (var i = 0; i < aKeys.length; i++) {
+      var cand = answers[aKeys[i]];
+      if (cand && typeof cand === "object" && (cand.type === "choice" || cand.type === "score")) {
+        tierAnswer = cand;
+        break;
+      }
+    }
+  }
+  if (!tierAnswer || typeof tierAnswer !== "object") return null;
+
+  var selectedTier = "";
+  var confidence = NaN;
+  var answerType = String(tierAnswer.type || "").toLowerCase();
+
+  if (answerType === "choice") {
+    selectedTier = normalizeTierOrLabel(tierAnswer.choice);
+    if (!selectedTier) return null;
+    confidence = parseFloat(tierAnswer.confidence);
+    if (
+      isNaN(confidence) &&
+      tierAnswer.probabilities &&
+      typeof tierAnswer.probabilities === "object" &&
+      tierAnswer.choice !== undefined &&
+      tierAnswer.probabilities[tierAnswer.choice] !== undefined
+    ) {
+      confidence = parseFloat(tierAnswer.probabilities[tierAnswer.choice]);
+    }
+  } else if (answerType === "score") {
+    // Per Decisions API docs: pick the discrete level with the highest probability.
+    var scoreLevelsToTier = ["tier1-fast", "tier4-open", "tier2-daily", "tier3-frontier"];
+    var bestIdx = -1;
+    var bestProb = -1;
+    if (tierAnswer.probabilities && typeof tierAnswer.probabilities === "object") {
+      var pKeys = Object.keys(tierAnswer.probabilities);
+      for (var pk = 0; pk < pKeys.length; pk++) {
+        var lvlIdx = parseInt(pKeys[pk], 10);
+        var lvlProb = parseFloat(tierAnswer.probabilities[pKeys[pk]]);
+        if (!isNaN(lvlIdx) && !isNaN(lvlProb) && lvlProb > bestProb) {
+          bestProb = lvlProb;
+          bestIdx = lvlIdx;
+        }
+      }
+    }
+    if (bestIdx >= 0 && bestIdx < scoreLevelsToTier.length) {
+      selectedTier = scoreLevelsToTier[bestIdx];
+    } else {
+      var rawScore = parseFloat(tierAnswer.score);
+      if (isNaN(rawScore)) return null;
+      var clampedIdx = Math.max(0, Math.min(scoreLevelsToTier.length - 1, Math.round(rawScore)));
+      selectedTier = scoreLevelsToTier[clampedIdx];
+    }
+    confidence = parseFloat(tierAnswer.confidence);
+    if (isNaN(confidence) && bestProb >= 0) {
+      confidence = bestProb;
+    }
+  } else {
+    return null;
+  }
+
+  if (!isNaN(confidence)) {
+    if (confidence < 0 || confidence > 1) {
+      confidence = Math.max(0, Math.min(1, confidence));
+    }
+  }
+
+  var minConfidence = parseFloat(
+    opts.decisionsMinConfidence !== undefined && opts.decisionsMinConfidence !== ""
+      ? opts.decisionsMinConfidence
+      : "0.50"
+  );
+  var lowConfTierRaw = String(opts.decisionsLowConfidenceTier || "tier2-daily")
+    .trim()
+    .toLowerCase();
+  var escalationThreshold = parseFloat(
+    opts.decisionsEscalationThreshold !== undefined && opts.decisionsEscalationThreshold !== ""
+      ? opts.decisionsEscalationThreshold
+      : "0.85"
+  );
+  if (isNaN(escalationThreshold) || escalationThreshold <= 0 || escalationThreshold > 0.99) {
+    escalationThreshold = 0.85;
+  }
+
+  var modelName = sanitizeClassifierName(opts.decisionsModel) || "gemini-decision-1";
+  var lowConfidenceEscalated = false;
+  var escalatedByNoul = false;
+  var deepProb = NaN;
+
+  if (!isNaN(confidence) && !isNaN(minConfidence) && minConfidence > 0 && confidence < minConfidence) {
+    if (lowConfTierRaw === "fallback" || lowConfTierRaw === "abstain") {
+      return null;
+    }
+    if (SMART_ROUTER_TIERS.indexOf(lowConfTierRaw) !== -1) {
+      selectedTier = lowConfTierRaw;
+      lowConfidenceEscalated = true;
+    }
+  }
+
+  // Parallel `needs_deep_reasoning` binary noul check (evaluated in the same forward pass).
+  // Escalates borderline choices (confidence < 0.75) when P(needs_deep_reasoning) >= threshold.
+  if (!lowConfidenceEscalated && selectedTier !== "tier3-frontier") {
+    var deepAnswer = answers.needs_deep_reasoning;
+    if (deepAnswer && typeof deepAnswer === "object" && String(deepAnswer.type || "").toLowerCase() === "noul") {
+      deepProb = parseFloat(deepAnswer.noul);
+      if (
+        !isNaN(deepProb) &&
+        deepProb >= escalationThreshold &&
+        (isNaN(confidence) || confidence < 0.75)
+      ) {
+        selectedTier = "tier3-frontier";
+        escalatedByNoul = true;
+      }
+    }
+  }
+
+  var decisionsSignal = {
+    "tier1-fast": "Lookup / Fast Turn",
+    "tier4-open": "Self-Contained Codegen",
+    "tier2-daily": "Multi-File Engineering",
+    "tier3-frontier": "Architecture / Deep Reasoning"
+  };
+
+  var confRounded = !isNaN(confidence) ? Math.round(confidence * 1000) / 1000 : NaN;
+  var reason;
+  var signal;
+  if (lowConfidenceEscalated) {
+    reason =
+      "decisions:low_confidence(" +
+      (isNaN(confRounded) ? "0" : String(confRounded)) +
+      ")->" +
+      selectedTier;
+    signal =
+      "Gemini Decisions API (Low-Confidence Escalation): " +
+      (decisionsSignal[selectedTier] || selectedTier);
+  } else if (escalatedByNoul) {
+    reason = "decisions:" + modelName + "->" + selectedTier + "(escalated)";
+    signal =
+      "Gemini Decisions API (Deep-Reasoning Escalation P=" +
+      String(Math.round(deepProb * 100) / 100) +
+      "): " +
+      (decisionsSignal[selectedTier] || selectedTier);
+  } else {
+    reason = "decisions:" + modelName + "->" + selectedTier;
+    signal = "Gemini Decisions API: " + (decisionsSignal[selectedTier] || selectedTier);
+  }
+
+  var usage = parsed.usage && typeof parsed.usage === "object" ? parsed.usage : {};
+  var inputTokens = parseInt(usage.total_input_tokens || usage.total_tokens || "0", 10);
+  if (isNaN(inputTokens) || inputTokens < 0) inputTokens = 0;
+  var outputTokens = parseInt(usage.total_output_tokens || "0", 10);
+  if (isNaN(outputTokens) || outputTokens < 0) outputTokens = 0;
+  var costUsd = (inputTokens * DECISIONS_INPUT_COST_PER_1M_USD) / 1000000.0;
+
+  return {
+    tier: selectedTier,
+    confidence: isNaN(confRounded) ? "" : String(confRounded),
+    model: modelName,
+    reason: reason,
+    signal: signal,
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+    costUsd: costUsd,
+    lowConfidenceEscalated: lowConfidenceEscalated,
+    escalatedByNoul: escalatedByNoul
+  };
+}
+
+function runApplySmartJudgeSelection(context, props) {
+  props = props || {};
   var judgeResponseRaw =
     context.getVariable("smartJudgeResponse.content") ||
     context.getVariable("judgeResponse.content") ||
     "";
   var customResponseRaw = context.getVariable("customClassifierResponse.content") || "";
+  var decisionsResponseRaw = context.getVariable("decisionsClassifierResponse.content") || "";
   var allowedTiers =
     context.getVariable("allowed_model_tiers") ||
     context.getVariable("auth.allowed_models") ||
     "tier1-fast,tier2-daily,tier4-open";
   var promptText = readSmartRouterPrompt(context);
+  var skipRules = context.getVariable("ai.decisionsSkipRules") === "true";
 
-  // 1. Deterministic rules always win over any classifier.
-  var rules = evaluateSmartRouterRules(promptText);
+  // 1. Deterministic rules win over classifiers unless `decisions-only` explicitly bypasses them.
+  var rules = skipRules
+    ? {
+        matched: false,
+        tier: "tier2-daily",
+        reason: "complexity:medium->tier2-daily",
+        signal: "Daily Multi-File Engineering",
+        explicitModelChoice: null
+      }
+    : evaluateSmartRouterRules(promptText);
   var selectedTier = rules.tier;
   var judgeReason = rules.reason;
   var explicitModelChoice = rules.explicitModelChoice;
@@ -229,6 +489,8 @@ function runApplySmartJudgeSelection(context) {
   var classifierUsed = deterministicMatched ? "rules" : "";
   var classifierModel = "";
   var classifierConfidence = "";
+  var classifierInputTokens = 0;
+  var classifierCostUsd = 0;
 
   // 2. Custom classifier (SC-CustomClassifier). Contract: a JSON object with either
   //    "tier" (one of SMART_ROUTER_TIERS) or "label" (SIMPLE|MEDIUM|COMPLEX|REASONING),
@@ -240,16 +502,7 @@ function runApplySmartJudgeSelection(context) {
     try {
       var customParsed = JSON.parse(customResponseRaw);
       if (customParsed && typeof customParsed === "object" && !customParsed.abstain) {
-        var labelToTier = {
-          SIMPLE: "tier1-fast",
-          MEDIUM: "tier4-open",
-          COMPLEX: "tier2-daily",
-          REASONING: "tier3-frontier"
-        };
-        var customTier = String(customParsed.tier || "");
-        if (!customTier && customParsed.label) {
-          customTier = labelToTier[String(customParsed.label).toUpperCase()] || "";
-        }
+        var customTier = normalizeTierOrLabel(customParsed.tier || customParsed.label);
         if (SMART_ROUTER_TIERS.indexOf(customTier) !== -1) {
           var customSignal = {
             "tier1-fast": "Lookup / Fast Turn",
@@ -270,13 +523,31 @@ function runApplySmartJudgeSelection(context) {
         }
       }
     } catch (eCustom) {
-      // Fall through to the LLM judge response (if any), then the length fallback.
+      // Fall through to Decisions API / LLM judge response (if any), then the length fallback.
     }
   }
 
-  // 3. LLM judge (SC-ModelJudge).
+  // 3. Gemini Decisions API classifier (SC-DecisionsClassifier, gemini-decision-1).
+  //    Returns calibrated probabilities & confidence with 0 output tokens.
+  var handledByDecisions = false;
+  if (!deterministicMatched && !handledByCustom && decisionsResponseRaw) {
+    var decisionsResult = parseDecisionsApiResponse(decisionsResponseRaw, props);
+    if (decisionsResult) {
+      handledByDecisions = true;
+      selectedTier = decisionsResult.tier;
+      classifierUsed = "decisions";
+      classifierModel = decisionsResult.model;
+      classifierConfidence = decisionsResult.confidence;
+      classifierInputTokens = decisionsResult.inputTokens;
+      classifierCostUsd = decisionsResult.costUsd;
+      judgeReason = decisionsResult.reason;
+      signalSummary = decisionsResult.signal;
+    }
+  }
+
+  // 4. LLM judge (SC-ModelJudge).
   var handledByJudge = false;
-  if (!deterministicMatched && !handledByCustom && judgeResponseRaw) {
+  if (!deterministicMatched && !handledByCustom && !handledByDecisions && judgeResponseRaw) {
     try {
       var parsed = JSON.parse(judgeResponseRaw);
       var textOut =
@@ -318,8 +589,8 @@ function runApplySmartJudgeSelection(context) {
       // Fallback heuristic below
     }
   }
-  // 4. Nothing answered (callout skipped, failed, timed out or abstained): prompt length.
-  if (!deterministicMatched && !handledByCustom && !handledByJudge) {
+  // 5. Nothing answered (callout skipped, failed, timed out or abstained): prompt length.
+  if (!deterministicMatched && !handledByCustom && !handledByDecisions && !handledByJudge) {
     classifierUsed = "length-fallback";
     if (promptText.length < 180) {
       selectedTier = "tier1-fast";
@@ -687,7 +958,7 @@ function runApplySmartJudgeSelection(context) {
   context.setVariable("ai.smartRouterBadge", smartRouterBadge);
 
   // Classifier telemetry (response headers and FinOps log read these).
-  //   ai.routerClassifier      rules | custom | gemini | length-fallback
+  //   ai.routerClassifier      rules | custom | decisions | gemini | length-fallback
   //   ai.routerClassifierMs    wall time between the prepare phase and this step, i.e. the
   //                            classifier callout as the gateway experienced it (0 if skipped)
   var calloutBackend = context.getVariable("ai.judgeBackend") || "";
@@ -695,7 +966,9 @@ function runApplySmartJudgeSelection(context) {
   var classifierMs = "";
   if (judgeStartMs > 0) {
     classifierMs =
-      calloutBackend === "gemini" || calloutBackend === "custom"
+      calloutBackend === "gemini" ||
+      calloutBackend === "custom" ||
+      calloutBackend === "decisions"
         ? String(Math.max(0, new Date().getTime() - judgeStartMs))
         : "0";
   }
@@ -704,6 +977,10 @@ function runApplySmartJudgeSelection(context) {
   context.setVariable("ai.routerClassifierMs", classifierMs);
   context.setVariable("ai.routerClassifierModel", classifierModel);
   context.setVariable("ai.routerClassifierConfidence", classifierConfidence);
+  if (classifierInputTokens > 0) {
+    context.setVariable("ai.routerClassifierInputTokens", String(classifierInputTokens));
+    context.setVariable("ai.routerClassifierCostUsd", classifierCostUsd.toFixed(8));
+  }
 }
 
 if (typeof context !== "undefined") {
@@ -713,7 +990,7 @@ if (typeof context !== "undefined") {
   if (smartJudgePolicyProps && String(smartJudgePolicyProps.phase || "") === "prepare") {
     runPrepareSmartJudge(context, smartJudgePolicyProps);
   } else {
-    runApplySmartJudgeSelection(context);
+    runApplySmartJudgeSelection(context, smartJudgePolicyProps);
   }
 }
 
@@ -721,6 +998,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     runApplySmartJudgeSelection: runApplySmartJudgeSelection,
     runPrepareSmartJudge: runPrepareSmartJudge,
-    evaluateSmartRouterRules: evaluateSmartRouterRules
+    evaluateSmartRouterRules: evaluateSmartRouterRules,
+    parseDecisionsApiResponse: parseDecisionsApiResponse
   };
 }

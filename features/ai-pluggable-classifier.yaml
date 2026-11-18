@@ -1,16 +1,26 @@
 # ==============================================================================
 # Feature: Rule-first Smart Router with a pluggable classifier
 #
-# Adds two steps around the LLM judge that features/ai-model-preprocess.yaml owns:
+# Adds steps around the LLM judge that features/ai-model-preprocess.yaml owns:
 #
-#   JS-PrepareSmartJudge  runs the deterministic keyword rules first and decides whether a
-#                         classifier call is needed at all. When a rule already decides, no
-#                         callout is made (the judge used to be called on every auto request).
-#   SC-CustomClassifier   optional. POSTs the developer's latest prompt to an HTTP classifier
-#                         you run yourself and reads back a tier. Used only when JudgeBackend
-#                         is "custom"; the default classifier is the LLM judge.
+#   JS-PrepareSmartJudge    runs the deterministic keyword rules first (unless JudgeBackend
+#                           is "decisions-only") and decides which classifier callout fires.
+#                           When a rule already decides, no network callout is made (0 ms).
+#   SC-CustomClassifier     optional. POSTs the developer's latest prompt to an HTTP
+#                           classifier you run yourself and reads back a tier (JudgeBackend
+#                           is "custom").
+#   KVM-GetDecisionsApiKey  reads `gemini_decisions_api_key` from an encrypted Apigee KVM
+#                           into `private.decisions.apiKey` when JudgeBackend is "decisions"
+#                           or "decisions-only".
+#   SC-DecisionsClassifier  calls the Google Gemini Decisions API
+#                           (POST https://generativelanguage.googleapis.com/v1beta/decisions,
+#                           model: gemini-decision-1) with zero output token decoding and
+#                           calibrated probabilities + confidence across parallel questions:
+#                             - routing_tier (choice): tier1-fast | tier2-daily | tier3-frontier | tier4-open
+#                             - needs_deep_reasoning (noul): parallel binary escalation check
 #
-# Selection order for `model: auto` stays: deterministic rule > classifier > prompt length.
+# Selection order for `model: auto`:
+#   deterministic rule (skipped in decisions-only) > classifier (custom | decisions | gemini) > prompt length.
 #
 # Bring your own classifier: set JudgeBackend to "custom" and point CustomClassifierUrl at
 # any service that accepts
@@ -26,9 +36,11 @@
 # account, which needs roles/run.invoker on that service.
 # ==============================================================================
 defaultParameters:
-  # gemini    = LLM judge (SC-ModelJudge), the default
-  # custom    = SC-CustomClassifier (your own classifier endpoint)
-  # heuristic = rules + prompt-length fallback only, never a network call
+  # gemini         = Vertex LLM judge (SC-ModelJudge, gemini-3.5-flash-lite), the default
+  # decisions      = Rule-first + Gemini Decisions API (SC-DecisionsClassifier, gemini-decision-1)
+  # decisions-only = Pure Gemini Decisions API for all `model: auto` turns (bypasses keyword rules)
+  # custom         = SC-CustomClassifier (your own classifier endpoint)
+  # heuristic      = rules + prompt-length fallback only, never a network call
   - name: JudgeBackend
     value: gemini
   # "true" lets the X-Router-Classifier request header pick the backend per request.
@@ -44,6 +56,26 @@ defaultParameters:
   # callout is skipped (continueOnError) and selection falls back to prompt length.
   - name: CustomClassifierTimeoutMs
     value: 1500
+  # Gemini Decisions API (gemini-decision-1) timeout and rubric parameters.
+  # Keep strings free of double quotes and curly braces: embedded in JSON inside Apigee MessageTemplate.
+  - name: DecisionsTimeoutMs
+    value: 1500
+  - name: DecisionsTierInstruction
+    value: "Select the software engineering complexity tier that best matches this developer request for LLM model routing."
+  - name: DecisionsTier1Criteria
+    value: "A quick factual answer, definition, short explanation, greeting, status check, file listing, grep lookup, or one-line shell command."
+  - name: DecisionsTier2Criteria
+    value: "Change, fix, debug, review, migrate, or extend existing code across multiple files, or diagnose a failure or stack trace in an existing codebase."
+  - name: DecisionsTier3Criteria
+    value: "Design a distributed system or architecture, compare major design trade-offs, threat-model security, or reason deeply about concurrency, scale, consistency, or failure modes."
+  - name: DecisionsTier4Criteria
+    value: "Write one small self-contained piece of code such as a standalone function, unit test, script, SQL query, regex, Dockerfile, config file, or solve a math or algorithmic exercise."
+  - name: DecisionsEscalationInstruction
+    value: "Does this developer request require deep architectural design, distributed systems reasoning, concurrency invariants, security threat modeling, or complex trade-off analysis?"
+  - name: DecisionsEscalationTrueCriteria
+    value: "Requires system architecture design, multi-service consistency or concurrency reasoning, threat modeling, or deep trade-off analysis."
+  - name: DecisionsEscalationFalseCriteria
+    value: "Can be answered with a factual lookup, standalone code snippet, or localized code change or bug fix."
 
 endpoints:
   - name: default
@@ -55,6 +87,12 @@ endpoints:
         - name: SC-CustomClassifier
           after: SC-ModelJudge
           condition: request.verb != "OPTIONS" and ai.useSmartJudge = "true" and ai.judgeBackend = "custom"
+        - name: KVM-GetDecisionsApiKey
+          after: SC-ModelJudge
+          condition: request.verb != "OPTIONS" and ai.useSmartJudge = "true" and ai.judgeBackend = "decisions"
+        - name: SC-DecisionsClassifier
+          after: SC-ModelJudge
+          condition: request.verb != "OPTIONS" and ai.useSmartJudge = "true" and ai.judgeBackend = "decisions"
 
 steps:
   - name: JS-PrepareSmartJudge
@@ -89,3 +127,65 @@ steps:
         authentication:
           googleIdToken:
             audience: "{CustomClassifierAudience}"
+
+  - name: KVM-GetDecisionsApiKey
+    type: KeyValueMapOperations
+    properties:
+      mapIdentifier: "{DecisionsApiKeyKvmMap}"
+      scope: environment
+      exclusiveCache: false
+      expiryTimeInSecs: 300
+      continueOnError: true
+      get:
+        - assignTo: private.decisions.apiKey
+          key:
+            - "{DecisionsApiKeyKvmEntry}"
+
+  - name: SC-DecisionsClassifier
+    type: ServiceCallout
+    properties:
+      timeout: "{DecisionsTimeoutMs}"
+      request:
+        variable: decisionsClassifierRequest
+        set:
+          verb: POST
+          headers:
+            Content-Type: application/json
+          payload:
+            contentType: application/json
+            content: |
+              {
+                "model": "{DecisionsModel}",
+                "input": "{ai.decisionsInput}",
+                "questions": {
+                  "routing_tier": {
+                    "type": "choice",
+                    "instructions": "{DecisionsTierInstruction}",
+                    "criteria": {
+                      "tier1-fast": "{DecisionsTier1Criteria}",
+                      "tier2-daily": "{DecisionsTier2Criteria}",
+                      "tier3-frontier": "{DecisionsTier3Criteria}",
+                      "tier4-open": "{DecisionsTier4Criteria}"
+                    }
+                  },
+                  "needs_deep_reasoning": {
+                    "type": "noul",
+                    "instructions": "{DecisionsEscalationInstruction}",
+                    "criteria": {
+                      "true_description": "{DecisionsEscalationTrueCriteria}",
+                      "false_description": "{DecisionsEscalationFalseCriteria}"
+                    }
+                  }
+                }
+              }
+      response: decisionsClassifierResponse
+      httpTargetConnection:
+        url: "{DecisionsApiUrl}"
+        authentication:
+          mode: "{DecisionsAuthMode}"
+          apiKeyHeader: x-goog-api-key
+          apiKeyValue: "{private.decisions.apiKey}"
+          userProjectHeader: "{GCPProjectId}"
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+            - https://www.googleapis.com/auth/generative-language.retriever

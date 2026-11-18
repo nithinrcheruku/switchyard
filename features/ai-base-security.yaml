@@ -27,7 +27,7 @@ steps:
     properties:
       allowOrigins: "{CorsAllowedOrigin}"
       allowMethods: "GET, POST, OPTIONS"
-      allowHeaders: "Content-Type, Authorization, x-api-key, x-goog-api-key, anthropic-version, anthropic-beta, x-goog-api-client, user-agent, x-routing-mode, x-model-override, x-model-map, x-switchyard-baseline, x-switchyard-ratio, x-switchyard-route-override, x-switchyard-model-map"
+      allowHeaders: "Content-Type, Authorization, x-api-key, x-goog-api-key, anthropic-version, anthropic-beta, x-goog-api-client, user-agent, x-routing-mode, x-router-classifier, x-model-override, x-model-map, x-switchyard-baseline, x-switchyard-ratio, x-switchyard-route-override, x-switchyard-model-map"
       maxAge: 3600
       generatePreflightResponse: true
 

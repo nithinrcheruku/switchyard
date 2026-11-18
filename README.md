@@ -47,6 +47,7 @@ The gateway exposes all 4 coding harness protocols on standard base paths, trans
 | **OpenAI Responses** | `/v1/responses`<br>`/responses` | **OpenAI Codex CLI**<br>Codex Desktop | Vertex Gemini (`:generateContent`)<br>Vertex Claude (`:rawPredict`)<br>Vertex MaaS | Any-to-any response streaming, tool-call items, and call ID mapping. |
 | **OpenAI Chat Completions** | `/v1/chat/completions`<br>`/v1/models` | **Pi / Oh-My-Pi**<br>**VS Code Copilot Chat**<br>**Cursor / Cline / Continue**<br>**OpenCode**<br>**DeepSeek Harness (`dsh`)** | Vertex Gemini<br>Vertex Claude<br>Vertex MaaS (Qwen, DeepSeek, GLM, Kimi) | Transforms standard `choices[].delta.tool_calls` and emits standard OpenAI SSE chunks with `[DONE]`. |
 | **Vertex GenAI** | `/v1beta/models/...`<br>`/v1beta1/models/...` | **Google Antigravity IDE & CLI (`agy`)**<br>Google GenAI SDKs | Native Vertex Gemini passthrough<br>Vertex Claude<br>Vertex MaaS | Native passthrough for Gemini; translates to Anthropic or OpenAI MaaS schemas when non-Gemini models are requested. |
+| **Gemini Decisions API** | `/v1beta/decisions` | **Google GenAI SDKs** (`google-genai` / `@google/genai` >= 3.2)<br>Agent Routers & Policy Engines | Gemini Developer API (`POST /v1beta/decisions`, `gemini-decision-1`) | Native passthrough preserving calibrated `noul`, `choice`, and `score` probabilities (`0` output tokens, \$0.10/1M input) under Apigee Auth, quotas, Model Armor, and FinOps. |
 
 ### Protocol Engineering Invariants
 - **Schema Preservation**: When converting tool definitions between Anthropic `input_schema`, OpenAI `parameters`, and Gemini `parametersJsonSchema`, string arrays (`required`, `enum`, `type`) are strictly preserved.
@@ -116,30 +117,37 @@ Requests that explicitly name a model (e.g., `gemini-4-argon`, `claude-sonnet-5-
 Incoming Turn (model: "auto")
       │
       ▼
-┌────────────────────────────────────────────────────────┐
-│ Step 1: Deterministic Heuristic Rules (0 ms network)   │
-│ • Slash commands (/models, /finops) ───► Tier 1 Fast   │
-│ • Architecture/Concurrency keywords ──► Tier 3 Frontier│
-│ • Code/Unit test generation ───────────► Tier 4 Open   │
-│ • Mathematical reasoning ──────────────► Tier 4 Open   │
-│ • Daily refactoring / code review ─────► Tier 2 Daily  │
-└────────────────────────┬───────────────────────────────┘
-                         │ (No rule matched)
+┌────────────────────────────────────────────────────────────────────┐
+│ Step 1: Deterministic Heuristic Rules (0 ms network)               │
+│ (Skipped when JudgeBackend = "decisions-only")                     │
+│ • Slash commands (/models, /finops) ───► Tier 1 Fast               │
+│ • Architecture/Concurrency keywords ──► Tier 3 Frontier            │
+│ • Code/Unit test generation ───────────► Tier 4 Open               │
+│ • Mathematical reasoning ──────────────► Tier 4 Open               │
+│ • Daily refactoring / code review ─────► Tier 2 Daily              │
+└────────────────────────┬───────────────────────────────────────────┘
+                         │ (No rule matched, or decisions-only)
                          ▼
-┌────────────────────────────────────────────────────────┐
-│ Step 2: Pluggable Classifier / LLM Judge (~520 ms)     │
-│ • gemini-3.5-flash-lite evaluates prompt complexity    │
-│ • Categorizes into SIMPLE, MEDIUM, COMPLEX, REASONING  │
-│ • Optional: Bring-Your-Own Classifier HTTPS endpoint   │
-└────────────────────────┬───────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ Step 2: Pluggable Classifier / Judge                               │
+│ • decisions / decisions-only (~150 ms, 0 output tokens, $0.10/1M): │
+│     POST /v1beta/decisions (gemini-decision-1) evaluates parallel  │
+│     `routing_tier` (choice) + `needs_deep_reasoning` (noul) with   │
+│     calibrated confidence thresholding & escalation                │
+│ • gemini (~520 ms, default):                                       │
+│     gemini-3.5-flash-lite classifies SIMPLE/MEDIUM/COMPLEX/REASONING│
+│ • custom: Bring-Your-Own HTTPS classifier (Google ID Token auth)   │
+│ • heuristic: Rules + prompt-length fallback only (0 ms network)    │
+└────────────────────────┬───────────────────────────────────────────┘
                          │
                          ▼
-┌────────────────────────────────────────────────────────┐
-│ Step 3: RBAC Capping & Fail-Open Fallback              │
-│ • If classifier times out: <180 chars ─► Tier 1 Fast   │
-│ • Standard Key: Tier 3 Frontier capped ─► Tier 2 Daily │
-│ • Frontier Key: All 4 tiers permitted                  │
-└────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ Step 3: RBAC Capping & Fail-Open Fallback                          │
+│ • Low-confidence Decisions split (<0.50) ─► Tier 2 Daily (safe)    │
+│ • If classifier times out/errors: <180 chars ─► Tier 1 Fast        │
+│ • Standard Key: Tier 3 Frontier capped ───────► Tier 2 Daily       │
+│ • Frontier Key: All 4 tiers permitted                              │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ### The 4 Routing Tiers
@@ -151,11 +159,56 @@ Incoming Turn (model: "auto")
 | **Tier 3** | **Frontier Reasoning**| `gemini-4-argon`<br>`claude-opus-5-5`<br>`claude-opus-4-7` | **\$5.00 – \$15.00** | Distributed system architecture, concurrency bugs, deadlocks, performance bottlenecks |
 | **Tier 4** | **Open / Math** | `deepseek-r1`<br>`glm-5.2`<br>`kimi-k2`<br>`llama-4-maverick` | **\$0.40 – \$2.00** | Algorithmic optimization, formal logic, mathematical proofs, multilingual code |
 
+### Pluggable Classifier Backends (Including Gemini Decisions API)
+
+Switchyard supports five `JudgeBackend` modes in [`features/ai-pluggable-classifier.yaml`](features/ai-pluggable-classifier.yaml), selectable at bundle build time via `STAGE_PARAMS` (or per-request via `X-Router-Classifier` in lab environments with `AllowClassifierOverride: "true"`):
+
+| `JudgeBackend` | Step 1 (0 ms Rules) | Step 2 Classifier | Auth | Latency / Cost |
+| :--- | :--- | :--- | :--- | :--- |
+| **`gemini`** *(default)* | Enabled | `SC-ModelJudge` (`gemini-3.5-flash-lite:generateContent`) | Vertex OAuth2 (`GoogleAccessToken`) | ~520 ms · \$0.075/\$0.30 per 1M |
+| **`decisions`** | Enabled | `SC-DecisionsClassifier` (`POST /v1beta/decisions`, `gemini-decision-1`) | Encrypted Apigee KVM `x-goog-api-key` or OAuth2 (`DecisionsAuthMode`) | ~150 ms · \$0.10 per 1M input · **0 output tokens** |
+| **`decisions-only`** | Bypassed | `SC-DecisionsClassifier` (`gemini-decision-1`) on **every** `model: "auto"` turn | Encrypted Apigee KVM `x-goog-api-key` or OAuth2 (`DecisionsAuthMode`) | ~150 ms · \$0.10 per 1M input · **0 output tokens** |
+| **`custom`** | Enabled | `SC-CustomClassifier` (`CustomClassifierUrl`) | Google ID Token (`CustomClassifierAudience`) | Custom endpoint SLA |
+| **`heuristic`** | Enabled | None (prompt-length fallback only) | None | 0 ms · \$0 |
+
+#### How Gemini Decisions API Classification Works (`gemini-decision-1`)
+On every classified turn, `SC-DecisionsClassifier` sends a single forward-pass request to `POST https://generativelanguage.googleapis.com/v1beta/decisions` with two parallel, independent questions over the shared input (billed once at \$0.10 / 1M input tokens, **0 output tokens**):
+1. **`routing_tier` (`choice`)**: Evaluates `tier1-fast`, `tier2-daily`, `tier3-frontier`, and `tier4-open`, returning the top choice, calibrated per-tier probabilities, and `confidence`.
+2. **`needs_deep_reasoning` (`noul`)**: Independent yes/no check (`0.01`–`0.99`) that escalates borderline choices (`confidence < 0.75` and `noul >= DecisionsEscalationThreshold`, default `0.85`) to `tier3-frontier` (still subject to RBAC capping).
+3. **Confidence Guardrail**: When `routing_tier.confidence < DecisionsMinConfidence` (default `0.50`), Switchyard escalates conservatively to `DecisionsLowConfidenceTier` (default `tier2-daily`, or `"fallback"` to defer to length fallback) instead of under-routing ambiguous prompts.
+4. **Fail-Open Safety**: Safety blocks (`prompt_feedback.block_reason`), HTTP errors, or timeouts (`DecisionsTimeoutMs`, default `1500` ms) fail open cleanly to prompt-length fallback.
+
+#### Deploying & Benchmarking with Gemini Decisions API
+
+```bash
+# 1. Compile Stage 07 bundles using the committed Decisions API parameter profile:
+STAGE_PARAMS=stages/params/decisions-router.json ./deploy.sh --stage 07-mvp-pilot --build-only
+
+#    Or use pure Decisions API mode (bypassing deterministic keyword rules):
+STAGE_PARAMS='{"JudgeBackend":"decisions-only","DecisionsAuthMode":"api_key"}' \
+  ./deploy.sh --stage 07-mvp-pilot --build-only
+
+#    Or authenticate via Google OAuth 2.0 + x-goog-user-project instead of KVM API key:
+STAGE_PARAMS='{"JudgeBackend":"decisions","DecisionsAuthMode":"oauth"}' \
+  ./deploy.sh --stage 07-mvp-pilot --build-only
+
+# 2. Provision the encrypted Apigee KVM (Terraform) & populate your Gemini API key out-of-band:
+cd infra && terraform apply -var="project_id=${GCP_PROJECT_ID}" -var="enable_gemini_decisions_api=true"
+# Then insert `gemini_decisions_api_key` into the `switchyard-secrets` KVM via Apigee KVM Entries API.
+
+# 3. Benchmark gemini-decision-1 directly on the 100-prompt routing eval set:
+GEMINI_API_KEY="your-key" /usr/bin/python3 tests/bench_decisions_api.py --out /tmp/decisions-bench.json
+
+# 4. Compare heuristic vs. gemini vs. decisions end-to-end through a lab gateway:
+GATEWAY_API_KEY="your-key" /usr/bin/python3 tests/bench_router_classifiers.py \
+  --gateway-url https://your-lab-gateway --backends heuristic,gemini,decisions
+```
+
 ### Classification Accuracy & Benchmarks
-- **Rule-First Speed**: Deterministic rules resolve high-frequency turns in **0 ms**, avoiding classifier latency for ~40% of standard coding requests.
-- **Judge Latency**: The `gemini-3.5-flash-lite` judge adds a median of **~520 ms** on ambiguous turns, achieving **97% agreement** with human software architects across a 100-prompt benchmark.
+- **Rule-First Speed**: Deterministic rules resolve high-frequency turns in **0 ms**, avoiding classifier latency for ~40% of standard coding requests (can be bypassed with `JudgeBackend: "decisions-only"`).
+- **LLM Judge Latency (`gemini`)**: The `gemini-3.5-flash-lite` judge adds a median of **~520 ms** on ambiguous turns, achieving **97% agreement** with human software architects across a 100-prompt benchmark.
+- **Gemini Decisions API (`decisions` / `decisions-only`)**: Dedicated `gemini-decision-1` endpoint evaluates parallel `choice` + `noul` questions in a single prefill pass (~150 ms, \$0.10 / 1M input tokens, 0 output tokens) with calibrated confidence attribution (`X-Router-Classifier: decisions`, `X-Router-Classifier-Model: gemini-decision-1`, `X-Router-Classifier-Confidence`).
 - **Overall Gateway Overhead**: Median TTFB overhead through Apigee X is **~32 ms** over warm HTTP/2 keep-alive connections.
-- **Gemini Decisions API Roadmap**: Future integration with the dedicated `gemini-decision-1` endpoint reduces judge latency down to **~150 ms** at \$0.10 / 1M input tokens with zero output decoding.
 
 ---
 
@@ -520,7 +573,7 @@ Enforce repository invariants and verify all 4 wire protocols before deploying c
 # 1. Compile all Apigee X XML proxy bundles (validates YAML + XML structure)
 ./deploy.sh --build-only
 
-# 2. Run the offline E2E verification suite (runs 87 checks in 15 seconds, no GCP auth needed)
+# 2. Run the offline E2E verification suite (runs 97 checks in 15 seconds, no GCP auth needed)
 /usr/bin/python3 tests/verify_e2e.py
 
 # 3. Test the developer CLI helper across harnesses

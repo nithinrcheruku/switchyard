@@ -226,6 +226,16 @@ const GATEWAY_MODEL_DISCOVERY_CATALOG = [
     funding_pool: "ANTIGRAVITY_GEMINI_CREDITS"
   },
   {
+    id: "gemini-decision-1",
+    aliases: [],
+    tier: "tier1-fast",
+    family: "gemini_decisions",
+    vertex_model_id: "gemini-decision-1",
+    description: "Google Gemini Decision 1 (v1beta Decisions API) — Calibrated yes/no (noul), choice, and score decisions with 0 output tokens ($0.10/1M input)",
+    pricing_per_1m_usd: { input: 0.1, output: 0.0 },
+    funding_pool: "ANTIGRAVITY_GEMINI_CREDITS"
+  },
+  {
     id: "gemini-3.1-pro-preview",
     aliases: ["gemini-3.1-pro"],
     tier: "tier2-daily",
@@ -445,7 +455,9 @@ function recordFinOpsTransaction(ctx, totalTokens) {
     const savingsPct =
       baselineCost > 0 ? ((savingsUsd / baselineCost) * 100.0).toFixed(1) + "%" : "0.0%";
     const pool =
-      targetFamily === "gemini" ? "ANTIGRAVITY_GEMINI_CREDITS" : "GCP_COMMIT_FSP_DISCOUNT";
+      targetFamily === "gemini" || targetFamily === "gemini_decisions"
+        ? "ANTIGRAVITY_GEMINI_CREDITS"
+        : "GCP_COMMIT_FSP_DISCOUNT";
     ctx.setVariable("estimated_cost_usd", estCost.toFixed(6));
     ctx.setVariable("frontier_baseline_cost_usd", baselineCost.toFixed(6));
     ctx.setVariable("routing_savings_usd", savingsUsd.toFixed(6));
@@ -490,7 +502,9 @@ function recordFinOpsTransaction(ctx, totalTokens) {
   const fundingPool =
     ctx.getVariable("funding_pool") ||
     ctx.getVariable("ai.fundingPool") ||
-    (targetFamily === "gemini" ? "ANTIGRAVITY_GEMINI_CREDITS" : "GCP_COMMIT_FSP_DISCOUNT");
+    (targetFamily === "gemini" || targetFamily === "gemini_decisions"
+      ? "ANTIGRAVITY_GEMINI_CREDITS"
+      : "GCP_COMMIT_FSP_DISCOUNT");
 
   const routingMode =
     ctx.getVariable("routing_mode") ||
@@ -1740,6 +1754,252 @@ function validateTranslatedBackendPayload(family, modelId, transformed) {
   return null;
 }
 
+const DECISIONS_API_URL =
+  process.env.DECISIONS_API_URL || "https://generativelanguage.googleapis.com/v1beta/decisions";
+const USE_LIVE_DECISIONS =
+  process.env.USE_LIVE_DECISIONS === "true" ||
+  (USE_LIVE_VERTEX && Boolean(process.env.GEMINI_API_KEY));
+
+async function callLiveDecisionsApi(payloadObj, timeoutMs) {
+  const targetUrl = new URL(DECISIONS_API_URL);
+  const bodyStr = JSON.stringify(payloadObj || {});
+  const headers = {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(bodyStr)
+  };
+  const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+  if (apiKey) {
+    headers["x-goog-api-key"] = apiKey;
+  } else {
+    const token = await getFreshVertexToken();
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+      if (GCP_PROJECT_ID && GCP_PROJECT_ID !== "mock-gcp-project") {
+        headers["x-goog-user-project"] = GCP_PROJECT_ID;
+      }
+    }
+  }
+  return new Promise((resolve) => {
+    const transport = targetUrl.protocol === "http:" ? http : https;
+    const req = transport.request(
+      {
+        hostname: targetUrl.hostname,
+        port: targetUrl.port || (targetUrl.protocol === "http:" ? 80 : 443),
+        path: targetUrl.pathname + targetUrl.search,
+        method: "POST",
+        headers: headers,
+        timeout: timeoutMs || 5000
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          let parsed = {};
+          try {
+            parsed = JSON.parse(data);
+          } catch (e) {
+            parsed = { raw: data };
+          }
+          resolve({ status: res.statusCode || 502, body: parsed, raw: data });
+        });
+      }
+    );
+    req.on("error", (err) => {
+      resolve({ status: 502, body: { error: { code: "upstream_error", message: String(err.message || err) } }, raw: "" });
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve({ status: 504, body: { error: { code: "timeout", message: "Decisions API timed out" } }, raw: "" });
+    });
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+function buildSmartRouterDecisionsPayload(promptText) {
+  return {
+    model: process.env.DECISIONS_MODEL || "gemini-decision-1",
+    input: String(promptText || "").slice(0, 16000),
+    questions: {
+      routing_tier: {
+        type: "choice",
+        instructions:
+          "Select the software engineering complexity tier that best matches this developer request for LLM model routing.",
+        criteria: {
+          "tier1-fast":
+            "A quick factual answer, definition, short explanation, greeting, status check, file listing, grep lookup, or one-line shell command.",
+          "tier2-daily":
+            "Change, fix, debug, review, migrate, or extend existing code across multiple files, or diagnose a failure or stack trace in an existing codebase.",
+          "tier3-frontier":
+            "Design a distributed system or architecture, compare major design trade-offs, threat-model security, or reason deeply about concurrency, scale, consistency, or failure modes.",
+          "tier4-open":
+            "Write one small self-contained piece of code such as a standalone function, unit test, script, SQL query, regex, Dockerfile, config file, or solve a math or algorithmic exercise."
+        }
+      },
+      needs_deep_reasoning: {
+        type: "noul",
+        instructions:
+          "Does this developer request require deep architectural design, distributed systems reasoning, concurrency invariants, security threat modeling, or complex trade-off analysis?",
+        criteria: {
+          true_description:
+            "Requires system architecture design, multi-service consistency or concurrency reasoning, threat modeling, or deep trade-off analysis.",
+          false_description:
+            "Can be answered with a factual lookup, standalone code snippet, or localized code change or bug fix."
+        }
+      }
+    }
+  };
+}
+
+function simulateDecisionsBackend(body) {
+  if (!body || typeof body !== "object") {
+    return { status: 400, body: { error: { code: "invalid_argument", message: "Request body must be a JSON object." } } };
+  }
+  const model = String(body.model || "");
+  if (model !== "gemini-decision-1") {
+    return {
+      status: 400,
+      body: { error: { code: "invalid_argument", message: `Unsupported Decisions API model '${model}'. Expected 'gemini-decision-1'.` } }
+    };
+  }
+  let inputText = "";
+  if (typeof body.input === "string") {
+    inputText = body.input;
+  } else if (Array.isArray(body.input)) {
+    inputText = body.input.map((b) => (b && typeof b.text === "string" ? b.text : `[${b && b.type || "media"}]`)).join("");
+  } else if (body.input && typeof body.input === "object") {
+    inputText = typeof body.input.text === "string" ? body.input.text : `[${body.input.type || "media"}]`;
+  }
+  if (!inputText || !String(inputText).trim()) {
+    return { status: 400, body: { error: { code: "invalid_argument", message: "input cannot be empty." } } };
+  }
+  const questions = body.questions;
+  if (!questions || typeof questions !== "object" || Array.isArray(questions)) {
+    return { status: 400, body: { error: { code: "invalid_argument", message: "questions must be a map of 1 to 1,000 questions." } } };
+  }
+  const qKeys = Object.keys(questions);
+  if (qKeys.length < 1 || qKeys.length > 1000) {
+    return { status: 400, body: { error: { code: "invalid_argument", message: "questions must contain between 1 and 1,000 entries." } } };
+  }
+  const lowerInput = inputText.toLowerCase();
+  const answers = {};
+  for (const qk of qKeys) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(qk)) {
+      return {
+        status: 400,
+        body: { error: { code: "invalid_argument", message: `Invalid question key '${qk}'. Must match [A-Za-z0-9_-]+ (1..64 chars).` } }
+      };
+    }
+    const q = questions[qk];
+    if (!q || typeof q !== "object" || !q.instructions) {
+      return {
+        status: 400,
+        body: { error: { code: "invalid_argument", message: `Question '${qk}' requires non-empty instructions.` } }
+      };
+    }
+    const qType = String(q.type || "").toLowerCase();
+    if (qType === "noul") {
+      const positiveHits =
+        /(cracked|damaged|broken|outage|503|refund|charged twice|distributed|deadlock|consensus|threat|architecture)/i.test(
+          lowerInput
+        );
+      const pYes = positiveHits ? 0.94 : 0.08;
+      answers[qk] = {
+        type: "noul",
+        noul: pYes,
+        confidence: Math.max(pYes, Number((1 - pYes).toFixed(2)))
+      };
+    } else if (qType === "choice") {
+      if (!q.criteria || typeof q.criteria !== "object" || Array.isArray(q.criteria)) {
+        return {
+          status: 400,
+          body: { error: { code: "invalid_argument", message: `Choice question '${qk}' requires a criteria map.` } }
+        };
+      }
+      // Decisions API sorts option keys alphabetically in UTF-8 byte order.
+      const optKeys = Object.keys(q.criteria).sort();
+      if (optKeys.length < 2 || optKeys.length > 255) {
+        return {
+          status: 400,
+          body: { error: { code: "invalid_argument", message: `Choice question '${qk}' must have 2 to 255 options.` } }
+        };
+      }
+      let bestKey = optKeys[0];
+      let bestScore = -1;
+      const inputTokens = lowerInput.split(/[^a-z0-9]+/).filter((w) => w.length > 2);
+      for (const ok of optKeys) {
+        const desc = `${ok} ${String(q.criteria[ok] || "")}`.toLowerCase();
+        let score = 0;
+        for (const tok of inputTokens) {
+          if (desc.includes(tok)) score += 1;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestKey = ok;
+        }
+      }
+      const topProb = bestScore > 0 ? 0.91 : Number((1 / optKeys.length + 0.25).toFixed(3));
+      const clampedTop = Math.min(0.95, topProb);
+      const remEach = Number(((1 - clampedTop) / (optKeys.length - 1)).toFixed(4));
+      const probs = {};
+      for (const ok of optKeys) {
+        probs[ok] = ok === bestKey ? clampedTop : remEach;
+      }
+      answers[qk] = {
+        type: "choice",
+        choice: bestKey,
+        probabilities: probs,
+        confidence: clampedTop
+      };
+    } else if (qType === "score") {
+      if (!Array.isArray(q.criteria) || q.criteria.length < 2 || q.criteria.length > 255) {
+        return {
+          status: 400,
+          body: { error: { code: "invalid_argument", message: `Score question '${qk}' requires a criteria array of 2 to 255 non-empty strings.` } }
+        };
+      }
+      const nLevels = q.criteria.length;
+      const targetIdx = Math.min(nLevels - 1, /(critical|outage|blocked|cancel|503|urgent)/i.test(lowerInput) ? nLevels - 1 : Math.floor(nLevels / 2));
+      const legend = {};
+      const probs = {};
+      const topP = 0.86;
+      const otherP = Number(((1 - topP) / (nLevels - 1)).toFixed(4));
+      let weighted = 0;
+      for (let idx = 0; idx < nLevels; idx++) {
+        legend[String(idx)] = String(q.criteria[idx]);
+        const p = idx === targetIdx ? topP : otherP;
+        probs[String(idx)] = p;
+        weighted += idx * p;
+      }
+      answers[qk] = {
+        type: "score",
+        score: Number(weighted.toFixed(2)),
+        legend: legend,
+        probabilities: probs,
+        confidence: topP
+      };
+    } else {
+      return {
+        status: 400,
+        body: { error: { code: "invalid_argument", message: `Unsupported question type '${qType}' for '${qk}'.` } }
+      };
+    }
+  }
+  const approxInputTokens = Math.max(24, Math.ceil(JSON.stringify(body).length / 4));
+  return {
+    status: 200,
+    body: {
+      answers: answers,
+      usage: {
+        total_input_tokens: approxInputTokens,
+        input_tokens_by_modality: [{ modality: "text", tokens: approxInputTokens }],
+        total_output_tokens: 0,
+        total_tokens: approxInputTokens
+      }
+    }
+  };
+}
+
 function simulateVertexModelGardenBackend(ctx, requestToolExecution, simulate429Primary) {
   if (simulate429Primary && ctx.getVariable("fallback_triggered") !== "true") {
     return {
@@ -1753,6 +2013,10 @@ function simulateVertexModelGardenBackend(ctx, requestToolExecution, simulate429
   const isCountTokens = ctx.getVariable("is_count_tokens") === "true";
   const transformedRaw = ctx.getVariable("request.content") || "{}";
   const transformed = JSON.parse(transformedRaw);
+
+  if (family === "gemini_decisions") {
+    return simulateDecisionsBackend(transformed);
+  }
 
   if (isCountTokens) {
     const approxTokens = Math.max(12, Math.ceil(transformedRaw.length / 4));
@@ -2490,10 +2754,11 @@ async function processGatewayRequest(method, url, rawHeaders, rawBody, httpResFo
   }
 
   if (ctx.getVariable("needs_smart_judge") === "true") {
-    // Mirrors the stage 06 PreFlow: JS-PrepareSmartJudge -> SC-ModelJudge | SC-CustomClassifier
-    // -> JS-ApplySmartJudgeSelection. No classifier is contacted from here: with test hooks
-    // on, X-Test-Custom-Classifier-Response supplies the JSON body SC-CustomClassifier would
-    // have received (absent header = classifier unreachable).
+    // Mirrors the stage 06/07 PreFlow: JS-PrepareSmartJudge -> SC-ModelJudge | SC-CustomClassifier
+    // | SC-DecisionsClassifier -> JS-ApplySmartJudgeSelection.
+    // With test hooks on, X-Test-Custom-Classifier-Response and X-Test-Decisions-Classifier-Response
+    // supply the JSON bodies those callouts would have received (absent header = unreachable unless
+    // live Decisions API is enabled via USE_LIVE_DECISIONS=true or GEMINI_API_KEY in live mode).
     runPrepareSmartJudge(ctx, {
       phase: "prepare",
       judgeBackend: process.env.SMART_ROUTER_JUDGE_BACKEND || "gemini",
@@ -2509,7 +2774,40 @@ async function processGatewayRequest(method, url, rawHeaders, rawBody, httpResFo
         String(normHeaders["x-test-custom-classifier-response"])
       );
     }
-    runApplySmartJudgeSelection(ctx);
+    if (ctx.getVariable("ai.judgeBackend") === "decisions") {
+      if (ALLOW_TEST_HOOKS && normHeaders["x-test-decisions-classifier-response"]) {
+        ctx.setVariable(
+          "decisionsClassifierResponse.content",
+          String(normHeaders["x-test-decisions-classifier-response"])
+        );
+      } else if (USE_LIVE_DECISIONS && !normHeaders["x-test-decisions-simulate-unreachable"]) {
+        const promptForDecisions =
+          ctx.getVariable("ai.latestUserPrompt") || ctx.getVariable("prompt_text_for_armor") || "";
+        const liveDec = await callLiveDecisionsApi(
+          buildSmartRouterDecisionsPayload(promptForDecisions),
+          parseInt(process.env.DECISIONS_TIMEOUT_MS || "1500", 10)
+        );
+        if (liveDec.status === 200 && liveDec.raw) {
+          ctx.setVariable("decisionsClassifierResponse.content", liveDec.raw);
+        }
+      }
+    }
+    const judgeApplyProps = {
+      decisionsModel: process.env.DECISIONS_MODEL || "gemini-decision-1",
+      decisionsMinConfidence:
+        (ALLOW_TEST_HOOKS && normHeaders["x-test-decisions-min-confidence"]) ||
+        process.env.DECISIONS_MIN_CONFIDENCE ||
+        "0.50",
+      decisionsLowConfidenceTier:
+        (ALLOW_TEST_HOOKS && normHeaders["x-test-decisions-low-confidence-tier"]) ||
+        process.env.DECISIONS_LOW_CONFIDENCE_TIER ||
+        "tier2-daily",
+      decisionsEscalationThreshold:
+        (ALLOW_TEST_HOOKS && normHeaders["x-test-decisions-escalation-threshold"]) ||
+        process.env.DECISIONS_ESCALATION_THRESHOLD ||
+        "0.85"
+    };
+    runApplySmartJudgeSelection(ctx, judgeApplyProps);
   }
 
   const promptForArmor = (ctx.getVariable("prompt_text_for_armor") || "").toLowerCase();
@@ -2634,7 +2932,13 @@ async function processGatewayRequest(method, url, rawHeaders, rawBody, httpResFo
   }
 
   let backendResp;
-  if (USE_LIVE_VERTEX && !simulate429Primary) {
+  if (ctx.getVariable("target_model_family") === "gemini_decisions" && USE_LIVE_DECISIONS) {
+    let parsedReqBody = {};
+    try {
+      parsedReqBody = JSON.parse(ctx.getVariable("request.content") || "{}");
+    } catch (e) {}
+    backendResp = await callLiveDecisionsApi(parsedReqBody, 30000);
+  } else if (USE_LIVE_VERTEX && !simulate429Primary) {
     backendResp = await callLiveVertexAI(ctx, customHeaders);
     const isUnenabledModel = (resp) => {
       if (!resp || (resp.status !== 404 && resp.status !== 400)) return false;
@@ -2668,7 +2972,10 @@ async function processGatewayRequest(method, url, rawHeaders, rawBody, httpResFo
     }
   } else {
     backendResp = simulateVertexModelGardenBackend(ctx, requestToolExec, simulate429Primary);
-    if (backendResp.status === 429 || backendResp.status >= 500) {
+    if (
+      ctx.getVariable("target_model_family") !== "gemini_decisions" &&
+      (backendResp.status === 429 || backendResp.status >= 500)
+    ) {
       runPrepareVertexFallbackPayload(ctx);
       ctx.setVariable("request.content", ctx.getVariable("vertex_fallback_payload"));
       backendResp = simulateVertexModelGardenBackend(ctx, requestToolExec, false);
